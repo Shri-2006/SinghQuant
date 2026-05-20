@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-SEARXNG_URL  = "https://sciresearch1-searxng.hf.space/search"
+SEARXNG_URL  = "http://localhost:8080/search"
 MACRO_QUERY  = "stock market crash bank failure circuit breaker federal reserve SEC lawsuit"
 
 

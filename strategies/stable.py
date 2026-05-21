@@ -110,10 +110,11 @@ def trade_ticker(api, ticker,multiplier=1.0,vix=None):
         try:
             position = api.get_position(ticker)
             entry_price = float(position.avg_entry_price)
-            if should_close_position(strategy, entry_price, current_price, equity,current_atr):
+            if should_close_position(strategy, entry_price, current_price, equity, current_atr):
                 api.close_position(ticker)
+                realized_pnl = (current_price - entry_price) / entry_price * current_pos
                 log_trade(strategy, ticker, "SELL", current_price, current_pos,
-                         reason="Stop loss or portfolio risk triggered")
+                    pnl=realized_pnl, reason="Stop loss or portfolio risk triggered")
                 print(f"Closed {ticker} — risk management triggered")
                 return
         except:
@@ -143,9 +144,15 @@ def trade_ticker(api, ticker,multiplier=1.0,vix=None):
                      reason="ML signals BUY, regime favorable")
             print(f"Buy {qty} {ticker} @ ${current_price}")
     elif prediction == 0 and current_pos > 0:
+        try:
+            position = api.get_position(ticker)
+            entry_price = float(position.avg_entry_price)
+            realized_pnl = (current_price - entry_price) / entry_price * current_pos
+        except:
+            realized_pnl = None
         api.close_position(ticker)
         log_trade(strategy, ticker, "SELL", current_price, current_pos,
-                 reason="ML signals SELL")
+            pnl=realized_pnl, reason="ML signals SELL")
         print(f"SELL {ticker} @ ${current_price}")
     else:
         print(f"HOLD {ticker}")

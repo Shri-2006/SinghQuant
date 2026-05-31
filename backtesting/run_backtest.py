@@ -1,4 +1,5 @@
 import os
+os.makedirs(os.path.join("backtesting", "results"), exist_ok=True)
 import pandas as pd
 from datetime import datetime, timedelta
 from data.polygon_fetcher import get_multiple_tickers

@@ -922,3 +922,11 @@ Decision: Add per-cycle Discord heartbeat pings from stable.py and risky1.py
 Why: Need real-time visibility into bot health without SSH.
          Kill switch alerts must be instant.
 Results: Pending check
+
+
+## May 30, 2026 - Changing Retraining Time
+
+**Context:** Oracle Cloud Instance needs more compute use otherwise it will be reclaimed by oracle and thats not good
+**Decision:** Increase training time from 14 days to 3 days
+**WHY** because it will increase compute use
+**result** unknown

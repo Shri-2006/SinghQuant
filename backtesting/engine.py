@@ -65,4 +65,7 @@ def get_backtest_summary(results):
         rows.append({
             'ticker':ticker,'total_return':portfolio.total_return(), 'sharpe_ratio':portfolio.sharpe_ratio(),'max_drawdown':portfolio.max_drawdown(), 'total_trades':portfolio.trades.count()
         })
+    if not rows:
+        print("No successful Backtests to summarize here")
+        return pd.DataFrame()
     return pd.DataFrame(rows).set_index('ticker')

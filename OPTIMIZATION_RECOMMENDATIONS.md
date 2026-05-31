@@ -94,3 +94,32 @@ trading system. Only introduce complexity AFTER:
 6. Feature engineering upgrades (medium term)
 7. Event-driven retraining (phase 2)
 8. Advanced RL (phase 2)
+
+
+## 🟡 Week 9/10 — Dynamic Asset Selection for Risky1
+
+### Current state
+RISKY1_ASSETS is a static list hardcoded in config.py.
+This defeats the purpose of a momentum strategy — the best
+momentum stocks change constantly.
+
+### Planned approach
+Replace static list with a dynamic screener that runs every cycle:
+
+1. Maintain a universe of ~100 liquid stocks (S&P 500 subset)
+2. Score each by momentum signal:
+   - Price > 20-day high (breakout)
+   - Volume > 1.5x 20-day average (confirmation)
+   - RSI between 50-70 (trending but not overbought)
+3. Pick top 5 by composite momentum score
+4. Trade those 5 tickers that cycle
+
+### Files to create/modify
+- data/stock_screener.py — new file, runs momentum scan
+- core/config.py — replace RISKY1_ASSETS with RISKY1_UNIVERSE
+- strategies/risky1.py — call screener at start of each cycle
+
+### Why this matters
+A static list means risky1 trades the same stocks regardless
+of market conditions. Dynamic selection means it always trades
+whatever has the strongest momentum signal right now.

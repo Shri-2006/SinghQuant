@@ -7,6 +7,7 @@ from core.features import build_features
 from models.train import load_model
 from backtesting.engine import run_backtest_multiple, get_backtest_summary
 from core.config import STABLE_ASSETS
+from data.sentiment_fetcher import add_sentiment_to_df
 
 # Date range for backtesting — last 2 years
 END   = datetime.today().strftime('%Y-%m-%d')
@@ -34,8 +35,12 @@ def backtest_strategy(strategy):
 
     # Fetch and feature data for all tickers
     raw_data      = get_multiple_tickers(tickers, START, END)
-    featured_data = {t: build_features(df) for t, df in raw_data.items()}
-
+    featured_data= {}
+    for t,df in raw_data.items():
+        df=build_features(df)
+        df=add_sentiment_to_df(df,t)
+        df=df.dropna()
+        featured_data[t]=df
     # Run backtest and store in summary
     results = run_backtest_multiple(featured_data, model, strategy, cash)
     summary = get_backtest_summary(results)

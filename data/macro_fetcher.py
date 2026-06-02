@@ -9,7 +9,11 @@ load_dotenv()
 
 
 SEARXNG_URL  = "http://localhost:8080/search"
-MACRO_QUERY  = "stock market crash bank failure circuit breaker federal reserve SEC lawsuit"
+MACRO_QUERY  = (
+    "stock market crash bank failure circuit breaker federal reserve SEC lawsuit "
+    "site:reuters.com OR site:bloomberg.com OR site:cnbc.com OR site:apnews.com "
+    "OR site:cnn.com OR site:yahoo.com OR site:ft.com OR site:wsj.com"
+)
 
 
 #SAP AI Core stuff
@@ -42,9 +46,20 @@ KEYWORD_SCORES = {
     "debt ceiling":          2,
     "credit downgrade":      3,
 }
-
-SCORE_CLEAR=1 #clear means its fine 
-SCORE_DANGER=8 #anything greater than or equal to this is bad
+NEGATIVE_KEYWORDS = {
+    "all-time high":  3,
+    "record high":    3,
+    "market rally":   2,
+    "stocks rise":    2,
+    "bull market":    2,
+    "market gains":   2,
+    "stocks climb":   2,
+    "market soars":   2,
+    "new high":       2,
+    "stocks surge":   2,
+}
+SCORE_CLEAR=2 #clear means its fine 
+SCORE_DANGER=12 #anything greater than or equal to this is bad
 
 def _search(query):
     """
@@ -64,14 +79,19 @@ def _search(query):
 
 def _score_keywords(text):
     """
-    Scores the search result text against the keyword list.  Returns (total_score, list of matched keywords).
+    Scores search result text against keyword lists.
+    Positive keywords add to score, negative keywords subtract.
+    Returns (total_score, list of matched positive keywords).
     """
     total = 0
-    hits= []
+    hits = []
     for keyword, weight in KEYWORD_SCORES.items():
         if keyword in text:
             total += weight
             hits.append(keyword)
+    for keyword, weight in NEGATIVE_KEYWORDS.items():
+        if keyword in text:
+            total -= weight
     return (total, hits)
 
 def _sap_is_configured():

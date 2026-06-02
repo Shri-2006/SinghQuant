@@ -1,35 +1,39 @@
 #command to run in case you don't know: bash setup.sh
-# Data sources 
-polygon-api-client
-textblob
-pandas
-numpy
-ta
 
-
-# ML provider
-scikit-learn
-xgboost
-stable-baselines3
-gymnasium
-
-# Backtesting of work
-vectorbt
-
-# Dashboard is streamlit
-streamlit
-
-# Scheduling of apis
-APScheduler
-
-# Environment is this
-python-dotenv
-
-# Testing of system
-pytest
-
-#google-generativeai
-google-genai
-
-#RSS sentiment of feedparser
+# Data sources
+polygon-api-client==1.16.3
+textblob==0.20.0
+pandas==2.3.3
+numpy==2.2.6
+ta==0.11.0
 feedparser==6.0.12
+requests==2.33.1
+
+# ML
+scikit-learn==1.7.2
+xgboost==3.2.0
+stable-baselines3==2.8.0
+gymnasium==1.2.3
+torch==2.11.0
+
+# Backtesting
+vectorbt==0.28.5
+
+# Dashboard
+streamlit==1.56.0
+plotly==6.7.0
+
+# Scheduling
+APScheduler==3.11.2
+
+# Environment
+python-dotenv==1.2.2
+
+# Testing
+pytest==9.0.3
+
+# Google AI
+google-genai==1.73.0
+
+# Alpaca trading
+alpaca-trade-api==3.0.0

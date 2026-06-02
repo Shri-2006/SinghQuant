@@ -85,17 +85,17 @@ def _get_sap_token():
 
 #adjusted using Gemini 2.5 Flash from the SAP AI Knowledge System I developed a few weeks ago
 def _classify_with_sap(text):
-    """
-    Sends search text to SAP AI Orchestration for classification. Returns DANGER, CAUTION, CLEAR, or None if it fails.
-    """
     try:
         token = _get_sap_token()
-        url   = f"{SAP_AI_API_URL}/v2/inference/deployments/{SAP_DEPLOYMENT_ID}/completion"
+        url = f"{SAP_AI_API_URL}/v2/inference/deployments/{SAP_DEPLOYMENT_ID}/completion"
 
         payload = {
-            "orchestration_config": {
-                "templating_module_config": {
-                    "template": (
+    "module_configurations": {
+        "templating_module_config": {
+            "template": [
+                {
+                    "role": "user",
+                    "content": (
                         "Classify the macro market risk based on this financial news text. "
                         "Output ONLY one word with no explanation: DANGER, CAUTION, or CLEAR. "
                         "DANGER = severe market risk event. "
@@ -103,17 +103,16 @@ def _classify_with_sap(text):
                         "CLEAR = normal conditions. "
                         "Text: {{?user_input}}"
                     )
-                },
-                "llm_module_config": {
-                    "model_name": "gemini-2.5-flash-lite",
-                    "model_version": "latest",
-                    "params": {"temperature": 0, "max_tokens": 5}
                 }
-            },
-            "input_params": {"user_input": text[:3000]},
-            "messages_history": []
+            ]
+        },
+        "llm_module_config": {
+            "model_name": "gemini-2.5-flash-lite",
+            "model_params": {"temperature": 0, "max_tokens": 5}
         }
-
+    },
+    "input_params": {"user_input": text[:3000]}
+}
         headers = {
             "Authorization": f"Bearer {token}",
             "AI-Resource-Group": RESOURCE_GROUP,
@@ -121,10 +120,22 @@ def _classify_with_sap(text):
         }
 
         response = requests.post(url, json=payload, headers=headers, timeout=15)
-        result   = response.json()
+        result = response.json()
 
-        # Extract the text response from orchestration output
-        signal = result["choices"][0]["message"]["content"].strip().upper()
+        # ✅ Handle both response formats
+        # Try OpenAI-style first
+        if "choices" in result:
+            signal = result["choices"][0]["message"]["content"].strip().upper()
+        # Try SAP Orchestration format
+        elif "orchestration_result" in result:
+            signal = result["orchestration_result"]["choices"][0]["message"]["content"].strip().upper()
+        # Try direct content
+        elif "content" in result:
+            signal = result["content"].strip().upper()
+        else:
+            print(f"[macro_fetcher] SAP unknown response format: {list(result.keys())}")
+            return None
+
         if signal in {"DANGER", "CAUTION", "CLEAR"}:
             return signal
         return None
@@ -180,46 +191,36 @@ def _classify_with_ai(content):
             return res
     return None
 
+import time
+_macro_cache = {"signal": None, "timestamp": 0}
+CACHE_TTL = 3600  # 1 hour
 
 
 def get_macro_signal():
-    """
-    Main function — call once per trading cycle in run().
-
-    Flow:
-        SearXNG fetch goes to keyword scoring which calls
-            score <= 1  then CLEAR
-            score >= 8  thenDANGER
-            if ambiguous   then AI classification which if that fails goes to keyword fallback
-
-    Always returns CLEAR on any failure -never blocks the bot, this plugs into existing VIX logic: DANGER raises effective VIX to 35, CAUTION raises it to 22.
-    """
+    global _macro_cache
+    if _macro_cache["signal"] and (time.time() - _macro_cache["timestamp"]) < CACHE_TTL:
+        return _macro_cache["signal"]
+    
     try:
         results_text = _search(MACRO_QUERY)
-
         if not results_text:
-            print("[macro_fetcher] SearXNG unavailable - defaulting to CLEAR")
-            return "CLEAR"
+            return "CLEAR"  # don't cache failures
 
         score, hits = _score_keywords(results_text)
         print(f"[macro_fetcher] keyword score={score}, hits={hits}")
 
-        # Clear cut cases — no AI needed
         if score <= SCORE_CLEAR:
-            return "CLEAR"
-        if score >= SCORE_DANGER:
-            return "DANGER"
+            signal = "CLEAR"
+        elif score >= SCORE_DANGER:
+            signal = "DANGER"
+        else:
+            ai_result = _classify_with_ai(results_text)
+            signal = ai_result if ai_result else ("CAUTION" if score >= 3 else "CLEAR")
 
-        # Ambiguous zone — ask AI
-        ai_result = _classify_with_ai(results_text)
-        if ai_result:
-            return ai_result
-
-        # AI failed — fall back to keyword logic
-        if score >= 3:
-            return "CAUTION"
-        return "CLEAR"
+        # ✅ Cache the result
+        _macro_cache = {"signal": signal, "timestamp": time.time()}
+        return signal
 
     except Exception:
-        print("[macro_fetcher] Unexpected error -defaulting to CLEAR")
+        print("[macro_fetcher] Unexpected error - defaulting to CLEAR")
         return "CLEAR"

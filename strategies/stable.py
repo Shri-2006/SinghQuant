@@ -190,6 +190,20 @@ def run():
             sleep_secs=get_sleep_duration(strategy)
             if sleep_secs>0:
                 print(f"Market is closed - slepeing for {sleep_secs//3600} hours {(sleep_secs%3600//60)} minutes")
+                log_heartbeat(strategy, "PAUSED")
+                # Send Discord notification so we know bot is alive but sleeping
+                try:
+                    account = api.get_account()
+                    send_heartbeat(
+                        bot_name=strategy,
+                        is_alive=True,
+                      portfolio_value=float(account.portfolio_value),
+                     last_trade_time="Market closed",
+                       last_sync_time=str(datetime.now()),
+                           extra_info=f"Sleeping {sleep_secs//3600}h — market closed"
+                     )
+                except:
+                  pass
                 time.sleep(sleep_secs)
                 continue
             

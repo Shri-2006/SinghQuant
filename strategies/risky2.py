@@ -50,7 +50,7 @@ def trade_ticker(api,ticker):
     obs,  _=env.reset()
 
     #nwo to get the action from model
-    action, _ = model.predict(obs, deterministic=True)
+    action, _ = model.predict(obs, deterministic=False)
     price=float(df['close'].iloc[-1])
     current_pos=get_current_position(api,ticker)
     max_pos=MAX_POSITION_SIZE[strategy]

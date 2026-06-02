@@ -30,3 +30,6 @@ pytest
 
 #google-generativeai
 google-genai
+
+#RSS sentiment of feedparser
+feedparser==6.0.12

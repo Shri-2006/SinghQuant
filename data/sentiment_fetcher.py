@@ -1,38 +1,43 @@
 import time
 import requests
+import feedparser
 from datetime import date
 from textblob import TextBlob
 from polygon import RESTClient
 from core.config import POLYGON_API_KEY
-USE_POLYGON=False
-SEARXNG_URL = "http://localhost:8080/search"
+
+USE_POLYGON_FALLBACK = False  # disabled — too many 429s
+
+_polygon_client = RESTClient(api_key=POLYGON_API_KEY)
 
 # Daily cache per ticker
 _sentiment_cache = {}
 _cache_date = {}
 
-# Polygon fallback client
-_polygon_client = RESTClient(api_key=POLYGON_API_KEY)
 
-def _get_sentiment_from_searxng(ticker):
+def _get_sentiment_from_rss(ticker):
     """
-    Fetches news headlines from local SearXNG and scores sentiment.
-    Returns float score or None if failed.
+    Fetches news from Yahoo Finance and Reuters RSS feeds.
+    Yahoo Finance gives ticker-specific news.
+    Reuters gives general market context.
+    No API key, no rate limits, free forever.
     """
     try:
-        # Clean ticker for search (remove X: prefix for crypto)
         clean_ticker = ticker.replace("X:", "")
-        query = f"{clean_ticker} stock news today"
-        response = requests.get(
-            SEARXNG_URL,
-            params={"q": query, "format": "json"},
-            timeout=10
-        )
-        data = response.json()
         texts = []
-        for result in data.get("results", []):
-            texts.append(result.get("title", ""))
-            texts.append(result.get("content", ""))
+
+        # Yahoo Finance ticker-specific RSS
+        yahoo_url = f"https://finance.yahoo.com/rss/headline?s={clean_ticker}"
+        yahoo_feed = feedparser.parse(yahoo_url)
+        for entry in yahoo_feed.entries[:10]:
+            texts.append(entry.get("title", ""))
+            texts.append(entry.get("summary", ""))
+
+        # Reuters general market news
+        reuters_url = "https://feeds.reuters.com/reuters/businessNews"
+        reuters_feed = feedparser.parse(reuters_url)
+        for entry in reuters_feed.entries[:5]:
+            texts.append(entry.get("title", ""))
 
         if not texts:
             return None
@@ -46,13 +51,10 @@ def _get_sentiment_from_searxng(ticker):
 
 def _get_sentiment_from_polygon(ticker, limit=10):
     """
-    Fallback — fetches news from Polygon API and scores sentiment.
-    Returns float score or None if failed.
+    Polygon fallback — disabled by default due to rate limits.
     """
-    #dont use polygon if false
-    if not USE_POLYGON:
+    if not USE_POLYGON_FALLBACK:
         return None
-    
     try:
         news = _polygon_client.list_ticker_news(ticker, limit=limit)
         scores = []
@@ -68,7 +70,7 @@ def _get_sentiment_from_polygon(ticker, limit=10):
 def get_sentiment(ticker):
     """
     Returns sentiment score for a ticker — cached once per day.
-    Tries SearXNG first (local, unlimited), falls back to Polygon.
+    Tries RSS first (Yahoo Finance + Reuters), falls back to Polygon.
     Returns 0.0 (neutral) if both fail.
     """
     today = date.today()
@@ -77,10 +79,10 @@ def get_sentiment(ticker):
     if _cache_date.get(ticker) == today and ticker in _sentiment_cache:
         return _sentiment_cache[ticker]
 
-    # Try SearXNG first
-    score = _get_sentiment_from_searxng(ticker)
+    # Try RSS first
+    score = _get_sentiment_from_rss(ticker)
 
-    # Fall back to Polygon if SearXNG failed
+    # Fall back to Polygon if RSS failed
     if score is None:
         score = _get_sentiment_from_polygon(ticker)
 

@@ -63,7 +63,7 @@ MAX_DRAWDOWN={
 #adjust stable assets to include whichever you want to invest in, it can't be populated like the risky1 because its supposed to be stable
 STABLE_ASSETS = ["SPY", "QQQ", "AAPL", "MSFT", "DIA", "IWM","SAP","AMZN"]
 #Risky1 will be modified by ML model so its dynamically changing
-RISKY1_ASSETS=["NVDA","AMD","TSLA","INTC","META","AMZN"]
+RISKY1_ASSETS=["NVDA","AMD","TSLA","INTC","META"]
 #risky2 is in crypto and i don't reallyy know what to do for making it "risky", the X is for polygon prefix of crypto
 RISKY2_ASSETS = ["X:BTCUSD","X:ETHUSD","X:SOLUSD","X:AVAXUSD","X:LINKUSD","X:ADAUSD","X:XRPUSD","X:DOGEUSD"
 ]

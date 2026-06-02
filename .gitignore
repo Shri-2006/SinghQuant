@@ -32,3 +32,13 @@ backtesting/results/
 # Oracle deployment script
 get_oracle.py
 debug_oracle.py
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+.env
+*.pkl
+trades.db

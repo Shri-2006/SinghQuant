@@ -1,7 +1,9 @@
 import time
 import numpy as np
 from datetime import datetime
-from core.config import CAPITAL, MAX_POSITION_SIZE, RISKY2_ASSETS
+#from core.config import CAPITAL, MAX_POSITION_SIZE, RISKY2_ASSETS
+from core.config import RISKY2_ASSETS, MAX_POSITION_SIZE, CAPITAL, POLYGON_API_KEY_RISKY2
+
 from core.logger import log_trade
 from core.features import build_features
 from data.polygon_fetcher import get_latest_bar
@@ -30,7 +32,7 @@ def trade_ticker(api,ticker):
     if model is None:
         print(f" No RL model has been loaded and {ticker} will be skipped")
         return;
-    df=get_latest_bar(ticker)
+    df = get_latest_bar(ticker, api_key=POLYGON_API_KEY_RISKY2)
     if df is None or df.empty:
         print(f"No data is in {ticker}, skipping")
         return

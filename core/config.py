@@ -25,7 +25,8 @@ ALPACA_LIVE_URL="https://api.alpaca.markets"
 
 #Polygon details for stocks and etf
 POLYGON_API_KEY=os.getenv("POLYGON_API_KEY") #now will also be for crypto
-
+POLYGON_API_KEY_RISKY1 =os.getenv("POLYGON_API_KEY_RISKY1", POLYGON_API_KEY)
+POLYGON_API_KEY_RISKY2=os.getenv("POLYGON_API_KEY_RISKY2", POLYGON_API_KEY)
 
 #KRAKEN for Crypto bot- Invalid due to geolocation restrictions.
 #KRAKEN_API_KEY=os.getenv("KRAKEN_API_KEY")

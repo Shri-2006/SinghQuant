@@ -930,3 +930,10 @@ Results: Pending check
 **Decision:** Increase training time from 14 days to 3 days
 **WHY** because it will increase compute use
 **result** unknown
+
+## June 1st, 2026 - Polygon API key amount
+
+**Context:** polygon keeps rate limiting
+**Decision** increase amount of api keys
+**WHY** it doesn't break any TOS and it reduces compltexity
+**result** implementing

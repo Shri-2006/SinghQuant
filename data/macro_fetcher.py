@@ -150,7 +150,7 @@ def _classify_with_gemini(text):
             f"Text: {text[:3000]}"
         )
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite-preview-06-17",
+            model="gemini-2.5-flash",
             contents=prompt
         )
         signal = response.text.strip().upper()

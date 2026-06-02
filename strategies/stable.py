@@ -5,7 +5,9 @@ import time
 #import pandas as pd
 from datetime import datetime
 #from core.config import (STABLE_ASSETS,MAX_POSITION_SIZE,MAX_DRAWDOWN,CAPITAL,PAPER_MODE,ALPACA_PAPER_URL,ALPACA_LIVE_URL )
-from core.config import (STABLE_ASSETS, MAX_POSITION_SIZE, CAPITAL)
+#from core.config import (STABLE_ASSETS, MAX_POSITION_SIZE, CAPITAL)
+from core.config import STABLE_ASSETS, MAX_POSITION_SIZE, CAPITAL, POLYGON_API_KEY
+
 #from core.logger import log_trade
 from core.features import build_features
 from data.polygon_fetcher import get_latest_bar
@@ -83,7 +85,7 @@ def trade_ticker(api, ticker,multiplier=1.0,vix=None):
     equity = float(account._raw['portfolio_value'])
 
     # Get price data first — needed for stop loss and ML
-    df = get_latest_bar(ticker)
+    df = get_latest_bar(ticker, api_key=POLYGON_API_KEY)
     if df is None or df.empty:
         print(f"No data for {ticker}, skipping")
         return

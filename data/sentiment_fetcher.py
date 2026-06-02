@@ -4,7 +4,7 @@ from datetime import date
 from textblob import TextBlob
 from polygon import RESTClient
 from core.config import POLYGON_API_KEY
-
+polygon=False
 SEARXNG_URL = "http://localhost:8080/search"
 
 # Daily cache per ticker
@@ -49,6 +49,10 @@ def _get_sentiment_from_polygon(ticker, limit=10):
     Fallback — fetches news from Polygon API and scores sentiment.
     Returns float score or None if failed.
     """
+    #dont use polygon if false
+    if(polygon==False):
+        return None
+    
     try:
         news = _polygon_client.list_ticker_news(ticker, limit=limit)
         scores = []

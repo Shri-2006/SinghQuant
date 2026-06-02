@@ -4,7 +4,7 @@ from datetime import date
 from textblob import TextBlob
 from polygon import RESTClient
 from core.config import POLYGON_API_KEY
-polygon=False
+USE_POLYGON=False
 SEARXNG_URL = "http://localhost:8080/search"
 
 # Daily cache per ticker
@@ -50,7 +50,7 @@ def _get_sentiment_from_polygon(ticker, limit=10):
     Returns float score or None if failed.
     """
     #dont use polygon if false
-    if(polygon==False):
+    if not USE_POLYGON:
         return None
     
     try:

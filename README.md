@@ -176,6 +176,17 @@ nohup python3 -u run.py > bot.log 2>&1 &
 - tests/test_regime.py — 15/15 passing
 - setup.sh — handles dependency installation including alpaca/websockets version conflict
 
+
+### Additional Completed details
+- Separate Polygon API keys per strategy to avoid rate limiting
+- SearXNG local sentiment (primary) with Polygon fallback
+- SAP AI Orchestration fixed — correct payload format
+- Macro scorer improved — news sources only, negative keywords
+- ADX threshold per strategy — risky1/risky2 use 20 vs stable's 25
+- Risky1 assets added — NVDA, AMD, TSLA, META
+- ProDesk nightly backup via rsync over Tailscale
+- Discord heartbeat for all 3 bots currently live including market-closed status
+
 ### nice sources to read up on:
 https://www.investopedia.com/terms/b/bollingerbands.asp
 

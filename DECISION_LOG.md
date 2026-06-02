@@ -937,3 +937,30 @@ Results: Pending check
 **Decision** increase amount of api keys
 **WHY** it doesn't break any TOS and it reduces compltexity
 **result** implementing
+
+
+## June 2, 2026 — Major System Fixes
+**SearXNG sentiment replacing Polygon news**
+Problem: Polygon news API rate limiting sentiment fetcher
+Solution: SearXNG local instance as primary, Polygon as fallback
+Result: sentiment 429 errors eliminated, 24hr cache added
+
+**SAP AI Orchestration payload format fix**
+Problem: SAP API changed format, classification returning None
+Solution: orchestration_config wrapping module_configurations
+Result: SAP classifying correctly, Gemini fallback rarely needed
+
+**Macro scorer false positives**
+Problem: Reddit doom posts triggering DANGER when market at ATH
+Solution: news-only sources, higher thresholds (DANGER=12), 
+          negative keywords for bullish signals
+Result: score dropped from 10 to 0 during bull market
+
+**ADX threshold lowered for risky1**
+Problem: ADX=25 too strict, risky1 never trading
+Solution: strategy-specific thresholds, risky1/risky2 use ADX=20
+Result: risky1 placed first trade (NVDA) on June 2
+
+**Risky1 assets added**
+Decision: NVDA, AMD, TSLA, META for momentum strategy
+Why: high volume, strong trends, volatile enough for signals

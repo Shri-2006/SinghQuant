@@ -85,34 +85,40 @@ def _get_sap_token():
 
 #adjusted using Gemini 2.5 Flash from the SAP AI Knowledge System I developed a few weeks ago
 def _classify_with_sap(text):
+    """
+    Sends search text to SAP AI Orchestration for classification. Returns DANGER, CAUTION, CLEAR, or None if it fails.
+    """
     try:
         token = _get_sap_token()
         url = f"{SAP_AI_API_URL}/v2/inference/deployments/{SAP_DEPLOYMENT_ID}/completion"
 
         payload = {
-    "module_configurations": {
-        "templating_module_config": {
-            "template": [
-                {
-                    "role": "user",
-                    "content": (
-                        "Classify the macro market risk based on this financial news text. "
-                        "Output ONLY one word with no explanation: DANGER, CAUTION, or CLEAR. "
-                        "DANGER = severe market risk event. "
-                        "CAUTION = elevated uncertainty. "
-                        "CLEAR = normal conditions. "
-                        "Text: {{?user_input}}"
-                    )
+            "orchestration_config": {
+                "module_configurations": {
+                    "templating_module_config": {
+                        "template": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Classify the macro market risk based on this financial news text. "
+                                    "Output ONLY one word with no explanation: DANGER, CAUTION, or CLEAR. "
+                                    "DANGER = severe market risk event. "
+                                    "CAUTION = elevated uncertainty. "
+                                    "CLEAR = normal conditions. "
+                                    "Text: {{?user_input}}"
+                                )
+                            }
+                        ]
+                    },
+                    "llm_module_config": {
+                        "model_name": "gemini-2.5-flash-lite",
+                        "model_params": {"temperature": 0, "max_tokens": 5}
+                    }
                 }
-            ]
-        },
-        "llm_module_config": {
-            "model_name": "gemini-2.5-flash-lite",
-            "model_params": {"temperature": 0, "max_tokens": 5}
+            },
+            "input_params": {"user_input": text[:3000]}
         }
-    },
-    "input_params": {"user_input": text[:3000]}
-}
+
         headers = {
             "Authorization": f"Bearer {token}",
             "AI-Resource-Group": RESOURCE_GROUP,
@@ -122,19 +128,7 @@ def _classify_with_sap(text):
         response = requests.post(url, json=payload, headers=headers, timeout=15)
         result = response.json()
 
-        # ✅ Handle both response formats
-        # Try OpenAI-style first
-        if "choices" in result:
-            signal = result["choices"][0]["message"]["content"].strip().upper()
-        # Try SAP Orchestration format
-        elif "orchestration_result" in result:
-            signal = result["orchestration_result"]["choices"][0]["message"]["content"].strip().upper()
-        # Try direct content
-        elif "content" in result:
-            signal = result["content"].strip().upper()
-        else:
-            print(f"[macro_fetcher] SAP unknown response format: {list(result.keys())}")
-            return None
+        signal = result["orchestration_result"]["choices"][0]["message"]["content"].strip().upper()
 
         if signal in {"DANGER", "CAUTION", "CLEAR"}:
             return signal
@@ -142,9 +136,7 @@ def _classify_with_sap(text):
 
     except Exception as e:
         print(f"[macro_fetcher] SAP classification failed: {e}")
-        return None
-
-# THIS IS GEMINI FALLBACK BTW
+        return None# THIS IS GEMINI FALLBACK BTW
 
 def _gemini_is_configured():
     return bool(GEMINI_API_KEY)

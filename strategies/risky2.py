@@ -10,6 +10,9 @@ from data.polygon_fetcher import get_latest_bar
 from data.sentiment_fetcher import add_sentiment_to_df
 from models.rl_train import load_rl_model
 from models.rl_environment import TradingEnvironment
+from data.discord_notifier import send_heartbeat, send_alert
+from core.logger import log_heartbeat
+#from datetime import datetime
 from paper_trading.alpaca_paper import get_api#, is_market_open
 strategy="risky2"
 model=load_rl_model()
@@ -76,6 +79,8 @@ def run():
     """
     api=get_api(strategy)
     print("Risky2 RL bot has started now.....")
+    last_trade_time=datetime.now()
+    last_sync_time=datetime.now()
     while True:
         try:
             for ticker in RISKY2_ASSETS:
@@ -85,6 +90,17 @@ def run():
                     print(f"There was an error in trading {ticker}: {e}")
                 time.sleep(20)
             print(f"Cycle was completed at {datetime.now()}, sleeping for 60 seconds (1min)")
+            last_sync_time = datetime.now()
+            log_heartbeat(strategy, "RUNNING")
+            account = api.get_account()
+            send_heartbeat(
+                bot_name="risky2",
+                is_alive=True,
+                portfolio_value=float(account.portfolio_value),
+                last_trade_time=str(last_trade_time),
+                last_sync_time=str(last_sync_time),
+                extra_info="Crypto cycle complete."
+            )
             time.sleep(60)
         except KeyboardInterrupt:
             print("Risky2 bot was manually stopped by user")

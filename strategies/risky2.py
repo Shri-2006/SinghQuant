@@ -17,21 +17,14 @@ model = load_rl_model()
 def _to_alpaca_symbol(ticker):
     """
     Converts Polygon crypto format to Alpaca format.
-    X:BTCUSD → BTC/USD
+    X:BTCUSD → BTCUSD (Alpaca stores without slash)
     Regular stocks pass through unchanged.
     """
     if ticker.startswith("X:"):
-        base = ticker[2:]  # remove X:
-        # insert slash before USD e.g. BTCUSD → BTC/USD
-        if base.endswith("USD"):
-            return base[:-3] + "/USD"
+        return ticker[2:]  # just remove X: prefix
     return ticker
 
 def get_current_position(api, ticker):
-    """
-    Returns current position size in dollars.
-    Returns 0.0 if no position held.
-    """
     try:
         alpaca_symbol = _to_alpaca_symbol(ticker)
         position = api.get_position(alpaca_symbol)

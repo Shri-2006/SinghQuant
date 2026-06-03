@@ -20,9 +20,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install alpaca-trade-api==3.0.0
+          pip install aiohttp>=3.9.0
+          pip install alpaca-trade-api==3.0.0 --no-deps
           pip install "websockets>=14.0"
           pip install pandas==2.3.3 numpy==2.2.6 ta==0.11.0 feedparser==6.0.12
+          pip install requests==2.33.1 python-dateutil pytz tzdata
           pip install scikit-learn==1.7.2 xgboost==3.2.0
           pip install stable-baselines3==2.8.0 gymnasium==1.2.3
           pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
@@ -30,6 +32,7 @@ jobs:
           pip install APScheduler==3.11.2 python-dotenv==1.2.2 pytest==9.0.3
           pip install google-genai==1.73.0 textblob==0.20.0
           pip install polygon-api-client==1.16.3
+          pip install msgpack==1.0.3 websocket-client PyYAML==6.0.1 deprecation
 
       - name: Run tests
         run: python -m pytest tests/ -v

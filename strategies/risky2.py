@@ -12,33 +12,40 @@ from data.discord_notifier import send_heartbeat, send_alert
 from paper_trading.alpaca_paper import get_api
 
 strategy = "risky2"
-model = load_rl_model()
+
+# Load one model per ticker at startup
+print("Loading per-ticker RL models...")
+MODELS = {}
+for ticker in RISKY2_ASSETS:
+    MODELS[ticker] = load_rl_model(ticker)
+    
 
 def _to_alpaca_symbol(ticker):
     """
     Converts Polygon crypto format to Alpaca format.
     X:BTCUSD → BTCUSD (Alpaca stores without slash)
-    Regular stocks pass through unchanged.
     """
     if ticker.startswith("X:"):
-        return ticker[2:]  # just remove X: prefix
+        return ticker[2:]
     return ticker
 
+
 def get_current_position(api, ticker):
+    """Returns current position size in dollars, 0 if none."""
     try:
-        alpaca_symbol = _to_alpaca_symbol(ticker)
-        position = api.get_position(alpaca_symbol)
-        return float(position.market_value)
+        return float(api.get_position(_to_alpaca_symbol(ticker)).market_value)
     except:
         return 0.0
 
+
 def trade_ticker(api, ticker):
     """
-    PPO model decides HOLD/BUY/SELL for each crypto ticker.
-    Builds live observation from latest price data and feeds to agent.
+    PPO model decides HOLD/BUY/SELL for a crypto ticker.
+    Uses ticker-specific model for better accuracy.
     """
+    model = MODELS.get(ticker)
     if model is None:
-        print(f"No RL model loaded — skipping {ticker}")
+        print(f"No model for {ticker} — skipping")
         return
 
     df = get_latest_bar(ticker, api_key=POLYGON_API_KEY_RISKY2)
@@ -50,7 +57,7 @@ def trade_ticker(api, ticker):
     df = add_sentiment_to_df(df, ticker)
     df = df.dropna()
     if len(df) == 0:
-        print(f"No feature rows for {ticker} after dropna, skipping")
+        print(f"No feature rows for {ticker}, skipping")
         return
 
     env = TradingEnvironment(
@@ -61,29 +68,24 @@ def trade_ticker(api, ticker):
     obs, _ = env.reset()
 
     action, _ = model.predict(obs, deterministic=False)
-    price = float(df['close'].iloc[-1])
+    price       = float(df['close'].iloc[-1])
     current_pos = get_current_position(api, ticker)
-    max_pos = MAX_POSITION_SIZE[strategy]
-    alpaca_symbol = _to_alpaca_symbol(ticker)
+    max_pos     = MAX_POSITION_SIZE[strategy]
+    alpaca_sym  = _to_alpaca_symbol(ticker)
 
     if action == 1 and current_pos == 0:
         qty = round(max_pos / price, 4)
         if qty * price >= 1.0:
-            api.submit_order(
-                symbol=alpaca_symbol,
-                qty=qty,
-                side='buy',
-                type='market',
-                time_in_force='gtc'
-            )
+            api.submit_order(symbol=alpaca_sym, qty=qty, side='buy',
+                             type='market', time_in_force='gtc')
             log_trade(strategy, ticker, "BUY", price, qty,
-                     reason="PPO agent chose BUY")
+                      reason="PPO agent chose BUY")
             print(f"BUY {qty} {ticker} @ ${price}")
 
     elif action == 2 and current_pos > 0:
-        api.close_position(alpaca_symbol)
+        api.close_position(alpaca_sym)
         log_trade(strategy, ticker, "SELL", price, current_pos,
-                 reason="PPO agent chose SELL")
+                  reason="PPO agent chose SELL")
         print(f"SELL {ticker} @ ${price}")
 
     else:
@@ -95,10 +97,10 @@ def run():
     Main loop for risky2 RL bot.
     Crypto trades 24/7 so no market hours check needed.
     """
-    api = get_api(strategy)
-    print("Risky2 RL bot has started now.....")
+    api             = get_api(strategy)
     last_trade_time = datetime.now()
-    last_sync_time = datetime.now()
+    last_sync_time  = datetime.now()
+    print("Risky2 RL bot has started now.....")
 
     while True:
         try:
@@ -107,16 +109,16 @@ def run():
                     trade_ticker(api, ticker)
                     last_trade_time = datetime.now()
                 except Exception as e:
-                    print(f"There was an error in trading {ticker}: {e}")
+                    print(f"Error trading {ticker}: {e}")
                 time.sleep(20)
 
-            print(f"Cycle was completed at {datetime.now()}, sleeping for 60 seconds (1min)")
+            print(f"Cycle completed at {datetime.now()}, sleeping 60 seconds")
             last_sync_time = datetime.now()
             log_heartbeat(strategy, "RUNNING")
+
             account = api.get_account()
             send_heartbeat(
-                bot_name="risky2",
-                is_alive=True,
+                bot_name="risky2", is_alive=True,
                 portfolio_value=float(account.portfolio_value),
                 last_trade_time=str(last_trade_time),
                 last_sync_time=str(last_sync_time),
@@ -125,9 +127,8 @@ def run():
             time.sleep(60)
 
         except KeyboardInterrupt:
-            print("Risky2 bot was manually stopped by user")
+            print("Risky2 bot manually stopped")
             break
-
         except Exception as e:
             print(f"Unexpected error: {e}\nRestarting in 60 seconds")
             time.sleep(60)

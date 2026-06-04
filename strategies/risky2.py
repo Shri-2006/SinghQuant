@@ -12,6 +12,9 @@ from data.discord_notifier import send_heartbeat, send_alert
 from paper_trading.alpaca_paper import get_api
 
 strategy = "risky2"
+#tracker for position opening to prevent imeddiate selling
+_position_open_time={}
+MIN_HOLD_SECONDS=1800 #30 min before allowed to sell
 
 # Load one model per ticker at startup
 print("Loading per-ticker RL models...")
@@ -80,12 +83,20 @@ def trade_ticker(api, ticker):
                              type='market', time_in_force='gtc')
             log_trade(strategy, ticker, "BUY", price, qty,
                       reason="PPO agent chose BUY")
+            _position_open_time[ticker]=datetime.now()
             print(f"BUY {qty} {ticker} @ ${price}")
 
     elif action == 2 and current_pos > 0:
+        open_time=_position_open_time.get(ticker)
+        if open_time:
+            held_seconds=(datetime.now()-open_time).total_seconds()
+            if held_seconds < MIN_HOLD_SECONDS:
+                print(f"HOLD {ticker}- minimum hold time not met({held_seconds:.0f}s / {MIN_HOLD_SECONDS}s)")
+                return
         api.close_position(alpaca_sym)
         log_trade(strategy, ticker, "SELL", price, current_pos,
                   reason="PPO agent chose SELL")
+        _position_open_time.pop(ticker,None)
         print(f"SELL {ticker} @ ${price}")
 
     else:

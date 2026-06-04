@@ -234,5 +234,5 @@ def get_macro_signal():
         return signal
 
     except Exception:
-        print("[macro_fetcher] Unexpected error - defaulting to CLEAR")
-        return "CLEAR"
+        print("[macro_fetcher] Unexpected error - defaulting to CAUTION")
+        return "CAUTION"  # was CLEAR — safety first on failure

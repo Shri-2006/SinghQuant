@@ -964,3 +964,76 @@ Result: risky1 placed first trade (NVDA) on June 2
 **Risky1 assets added**
 Decision: NVDA, AMD, TSLA, META for momentum strategy
 Why: high volume, strong trends, volatile enough for signals
+
+
+## June 3, 2026 — Per-Ticker PPO Models for Risky2
+
+**Context:**
+Single combined model trained on all 8 crypto tickers produced
+bad results — ep_rew_mean inflated to 4e+05, entropy near 0,
+value loss 2e+07. Root cause: BTC at $66k dominates reward
+signal vs DOGE at $0.09, model learned to only care about BTC.
+
+**Decision:** Train one PPO model per ticker (Option A)
+**Why:**
+- Each ticker has unique price patterns and volatility
+- Per-ticker models eliminate price scale bias in rewards
+- 100k timesteps per ticker × 8 tickers ≈ same total compute
+- Falls back to legacy model if ticker model missing
+
+**Files changed:**
+- models/rl_train.py — get_model_path(), train_all_tickers()
+- strategies/risky2.py — MODELS dict, loads per-ticker at startup
+
+**Result:** Training in progress on Oracle ARM
+
+---
+
+## June 3, 2026 — RSS Feeds for Sentiment
+
+**Context:**
+Polygon news API hitting 429 rate limits constantly for sentiment.
+SearXNG returning 0 results for individual stock tickers.
+
+**Decision:** Switch to Yahoo Finance + Reuters RSS feeds
+**Why:**
+- Yahoo Finance has per-ticker RSS (free, no API key)
+- Reuters covers general market context
+- feedparser library handles parsing cleanly
+- No rate limits, no API keys, updates every few minutes
+- 24-hour cache per ticker keeps API calls near zero
+
+**Result:** 429 errors eliminated on sentiment fetching
+
+---
+
+## June 3, 2026 — Risky2 Symbol Format Fix
+
+**Context:**
+Alpaca stores crypto as BTCUSD (no slash) but code was
+converting X:BTCUSD → BTC/USD (with slash). Position check
+always returned 0, bot kept buying same ticker repeatedly.
+Cash went negative (-$91.49).
+
+**Decision:** Convert X:BTCUSD → BTCUSD (just remove X: prefix)
+**Why:** Match Alpaca's actual storage format exactly.
+**Result:** Duplicate buys eliminated, position checks working
+
+---
+
+## June 3, 2026 — RL Reward Function Fix
+
+**Context:**
+Risky2 was always HOLDing (action 0). Root cause: BUY reward
+was -0.001 (negative!) while HOLD reward was 0.0. Agent
+rationally learned HOLD = always better than BUY.
+
+**Decision:** Redesign reward function to incentivize trading:
+- BUY: +0.001 (small positive to encourage exploration)
+- SELL: normalized PnL × 1.5 bonus for profitable trades
+- HOLD with winner: small positive reward
+- HOLD with loser: stronger penalty
+- HOLD with no position when price rising: small penalty
+
+**Result:** Agent now buys crypto — BTC, SOL, AVAX, DOGE all
+trading on first cycle after retraining

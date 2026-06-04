@@ -89,6 +89,11 @@ def trade_ticker(api, ticker, multiplier=1.0, vix=None):
 
     # Momentum exit — risky1 specific, exits before ML check
     if df['momentum_5'].iloc[-1] < 0 and current_pos > 0:
+        try:
+            entry_price=float(api.get_position(ticker).avg_entry_price)
+            realized_pnl=(current_price-entry_price)/entry_price*current_pos
+        except:
+            realized_pnl=None
         api.close_position(ticker)
         log_trade(strategy, ticker, "SELL", current_price, current_pos,
                   reason="Momentum turned negative")

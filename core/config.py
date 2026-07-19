@@ -10,7 +10,7 @@ DISCORD_WEBHOOK_URL=os.getenv("DISCORD_WEBHOOK_URL","")
 PAPER_MODE={
     "stable":True,#flip to false to make stable live
     "risky1":True,#flip to false to make risky1live
-    "risky2":True#flip to false to make risky2 live, like will take more time since its RL experimental
+    "risky2":False#flip to false to make risky2 live, like will take more time since its RL experimental
 }
 
 #Alpaca Details
@@ -73,7 +73,7 @@ RETRAIN_INTERVAL_DAYS=3
 
 
 FEATURE_FLAGS={
-    "risky2_enabled":True #when false, risky2 model simply doesn't run. when true, risky2 model runs. meant because its still being built as of this moment and is wasting resources.
+    "risky2_enabled":False #when false, risky2 model simply doesn't run. when true, risky2 model runs. meant because its still being built as of this moment and is wasting resources.
 }
 
 

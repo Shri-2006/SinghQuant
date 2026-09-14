@@ -3,12 +3,19 @@ import requests
 import feedparser
 from datetime import date
 from textblob import TextBlob
-from polygon import RESTClient
 from core.config import POLYGON_API_KEY
 
 USE_POLYGON_FALLBACK = False  # disabled — too many 429s
 
-_polygon_client = RESTClient(api_key=POLYGON_API_KEY)
+_polygon_client = None  # created lazily; importing this module must not need a key
+
+
+def _get_polygon_client():
+    global _polygon_client
+    if _polygon_client is None:
+        from polygon import RESTClient
+        _polygon_client = RESTClient(api_key=POLYGON_API_KEY)
+    return _polygon_client
 
 # Daily cache per ticker
 _sentiment_cache = {}
@@ -21,6 +28,8 @@ def _get_sentiment_from_rss(ticker):
     Yahoo Finance gives ticker-specific news.
     Reuters gives general market context.
     No API key, no rate limits, free forever.
+    NOTE: feeds.reuters.com has been offline for years; feedparser returns an
+    empty feed for it, so only the Yahoo feed contributes in practice.
     """
     try:
         clean_ticker = ticker.replace("X:", "")
@@ -56,7 +65,7 @@ def _get_sentiment_from_polygon(ticker, limit=10):
     if not USE_POLYGON_FALLBACK:
         return None
     try:
-        news = _polygon_client.list_ticker_news(ticker, limit=limit)
+        news = _get_polygon_client().list_ticker_news(ticker, limit=limit)
         scores = []
         for article in news:
             score = TextBlob(article.title).sentiment.polarity
@@ -106,12 +115,18 @@ def get_sentiment_label(score):
         return "NEUTRAL"
 
 
-def add_sentiment_to_df(df, ticker):
+def add_sentiment_to_df(df, ticker, score=None):
     """
-    Adds sentiment score column to any OHLCV dataframe.
-    Called from build_features before ML training.
+    Adds a `sentiment` column (one constant value) to any OHLCV dataframe.
+
+    CAVEAT (audit issue M-03): today's score is stamped onto every row. For
+    live inference that is fine (one row matters). For TRAINING it means two
+    years of history get today's sentiment, so the column carries no temporal
+    information; models.train passes score=0.0 to keep the column neutral and
+    the feature layout identical between training and inference.
     """
-    score = get_sentiment(ticker)
+    if score is None:
+        score = get_sentiment(ticker)
     df = df.copy()
     df['sentiment'] = score
     return df

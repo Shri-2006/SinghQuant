@@ -12,8 +12,12 @@ def generate_signals(df,model):
 
     """
 
-    feature_cols=[c for c in df.columns if c not in ['open','high','low','close','volume']]
-    X=df[feature_cols].values
+    from models.train import features_for_model, FEATURE_COLUMNS
+    if all(c in df.columns for c in FEATURE_COLUMNS):
+        X = features_for_model(df, model)      # same layout/validation as live inference
+    else:  # legacy/test frames without the full feature set
+        feature_cols=[c for c in df.columns if c not in ['open','high','low','close','volume']]
+        X=df[feature_cols].values
     predictions=model.predict(X)
     entries=pd.Series(predictions==1,index=df.index)#BUY signals is entries
     exits=pd.Series(predictions==0,index=df.index)#Sell signals is exits

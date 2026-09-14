@@ -1037,3 +1037,28 @@ rationally learned HOLD = always better than BUY.
 
 **Result:** Agent now buys crypto — BTC, SOL, AVAX, DOGE all
 trading on first cycle after retraining
+
+---
+
+## September 14, 2026 — Restoration audit (AI-assisted)
+
+**Context:** The project had been idle; a ZIP of the repository was audited
+against an export of the live trade log (6,276 rows). Full record, root
+causes, fixes and validation are in `ENGINEERING_AUDIT.md`.
+
+**Decisions made (alternatives are recorded in the audit):**
+- Strategy ownership via a per-strategy SQLite ledger (`core/portfolio.py`)
+  rather than three separate Alpaca accounts. Why: works with the existing
+  single paper account and existing database; per-strategy keys remain an
+  optional, stronger isolation.
+- One shared engine (`strategies/common.py`) replaces the three copied loops.
+  Why: the same bug had to be fixed three times otherwise.
+- Kill switch measures the STRATEGY's own equity against its persisted peak
+  and needs two consecutive critical readings. Why: on July 7 both bots fired
+  on one unvalidated account-wide reading and liquidated everything.
+- Entries are refused while the strategy's own exit condition is true, and
+  no re-entry happens on the bar just exited. Why: this is the mechanism of
+  the every-cycle BUY/SELL oscillation, not a threshold problem.
+- Paper-only guard: live endpoint requires an explicit environment opt-in.
+- Dependencies: compatible ranges (`requirements.txt`) verified on Python
+  3.14, original pins kept for Docker/3.11.

@@ -4,10 +4,14 @@ https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks
 """
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from core.config import DISCORD_WEBHOOK_URL
 
 logger=logging.getLogger(__name__)
+
+
+def _utc_stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def _post_to_discord(payload:dict):
     """
@@ -45,7 +49,7 @@ def send_heartbeat(bot_name: str,is_alive: bool,portfolio_value: float, last_tra
 
     status_emoji="🟢" if is_alive else "🔴"
     status_text="ALIVE" if is_alive else "DEAD and ERROR PROBLEM NOW"
-    timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp=_utc_stamp()
 
     #clean discord embded using online template
     embed = {
@@ -94,7 +98,7 @@ def send_alert(bot_name: str,alert_type: str,message: str,portfolio_value: float
     message: Human-readable description
     portfolio_value Portfolio value at time of alert
     """
-    timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp=_utc_stamp()
     embed={
         "title": f"🚨 ALERT — {bot_name} | {alert_type}",
         "description": message,

@@ -1,18 +1,31 @@
 import os
 import pandas as pd
 from core.logger import get_trades
+from core.config import CAPITAL
 from metrics.risk import compute_all_metrics
+
+TRADE_COLUMNS = ['id','timestamp','strategy','asset','action','price','quantity','pnl','reason']
+
 
 def get_strategy_returns(strategy):
     """
-    This will pull the trade history from SQlite file and compute daily returns for each strategy
+    Pulls closed trades from SQLite and returns per-trade RETURNS (fractions of
+    the strategy's capital), which is what metrics.risk expects.
+
+    BUG FIXED (audit issue M-04): the original returned raw dollar pnl and fed
+    it to Sharpe/Sortino/max-drawdown, which compound (1 + r); a $17 win was
+    treated as a 1,700% return.
     """
     trades=get_trades(strategy)
     if not trades:
         return None
-    df=pd.DataFrame(trades,columns= ['id','timestamp','strategy','asset','action','price','quantity','pnl','reason'])
-    df['pnl']=pd.to_numeric(df['pnl'],errors='coerce').fillna(0)
-    return df['pnl']
+    df=pd.DataFrame(trades,columns=TRADE_COLUMNS)
+    df=df[df['action']=='SELL']
+    df['pnl']=pd.to_numeric(df['pnl'],errors='coerce')
+    df=df[df['pnl'].notna()]
+    if df.empty:
+        return None
+    return (df['pnl'] / CAPITAL[strategy]).reset_index(drop=True)
 
 
 def print_comparision():
@@ -33,7 +46,7 @@ def print_comparision():
                          ,"win_loss": f"{metrics['win_loss_ratio']:.2%}",
                          "total_trades": len(returns),
                          "status": "RUNNING"})
-            
+
     df=pd.DataFrame(rows).set_index("strategy")
     print("\n======TRADING SYSTEM STRATEGY COMPARISION TABLE======\n")
     print(df.to_string())

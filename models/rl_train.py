@@ -2,23 +2,16 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
 from models.rl_environment import TradingEnvironment
-from data.polygon_fetcher import get_historical_data
-from core.features import build_features
-from data.sentiment_fetcher import add_sentiment_to_df
 from core.config import CAPITAL, MAX_POSITION_SIZE, RISKY2_ASSETS
 
 STRATEGY    = "risky2"
-MODEL_DIR   = "models"
+# Absolute path: the original "models" was relative to the current working
+# directory, so model loading depended on where the process was launched.
+MODEL_DIR   = os.path.dirname(os.path.abspath(__file__))
 
 # Default crypto tickers to train on
-DEFAULT_TICKERS = [
-    "X:BTCUSD", "X:ETHUSD", "X:SOLUSD",
-    "X:AVAXUSD", "X:LINKUSD", "X:ADAUSD",
-    "X:XRPUSD", "X:DOGEUSD"
-]
+DEFAULT_TICKERS = list(RISKY2_ASSETS)
 
 
 def get_model_path(ticker):
@@ -36,6 +29,9 @@ def prepare_rl_data(ticker, days_to_look_back=365):
     Fetches OHLCV, builds features, adds sentiment, drops NaN rows.
     Uses 1 year of data by default to capture multiple market regimes.
     """
+    from data.polygon_fetcher import get_historical_data
+    from core.features import build_features
+    from data.sentiment_fetcher import add_sentiment_to_df
     end   = datetime.today().strftime('%Y-%m-%d')
     start = (datetime.today() - timedelta(days=days_to_look_back)).strftime('%Y-%m-%d')
 
@@ -46,7 +42,7 @@ def prepare_rl_data(ticker, days_to_look_back=365):
         raise ValueError(f"No data returned for {ticker}")
 
     df = build_features(df)
-    df = add_sentiment_to_df(df, ticker)
+    df = add_sentiment_to_df(df, ticker, score=0.0)  # neutral constant during training (audit M-03)
     df = df.dropna()
 
     print(f"{ticker}: {len(df)} rows ready")
@@ -57,11 +53,9 @@ def train_rl_model(ticker="X:BTCUSD", days_to_look_back=365, timesteps=100000):
     """
     Trains a PPO agent for a single crypto ticker.
     Saves model to ticker-specific path e.g. models/risky2_BTCUSD.zip
-    
-    ticker:            Polygon format e.g. X:BTCUSD
-    days_to_look_back: how far back to fetch training data
-    timesteps:         100k per ticker is enough for per-asset training
     """
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.env_checker import check_env
     df  = prepare_rl_data(ticker, days_to_look_back)
     env = TradingEnvironment(
         df=df,
@@ -109,7 +103,7 @@ def train_all_tickers(tickers=None, days_to_look_back=365, timesteps=100000):
         print(f"Training {ticker}...")
         print(f"{'='*50}")
         try:
-            model = train_rl_model(ticker, days_to_look_back, timesteps)
+            train_rl_model(ticker, days_to_look_back, timesteps)
             results[ticker] = "success"
         except Exception as e:
             print(f"Failed to train {ticker}: {e}")
@@ -128,6 +122,7 @@ def load_rl_model(ticker="X:BTCUSD"):
     Returns None if no model exists yet — bot will skip trading.
     Falls back to legacy risky2_model.zip if ticker model not found.
     """
+    from stable_baselines3 import PPO
     model_path = get_model_path(ticker)
 
     if os.path.exists(model_path):

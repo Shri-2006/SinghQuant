@@ -1,14 +1,31 @@
 import os
+import time
 import pandas as pd
 from datetime import datetime, timedelta
-from polygon import RESTClient
 from core.config import POLYGON_API_KEY, POLYGON_API_KEY_RISKY1, POLYGON_API_KEY_RISKY2
 
-#first initialize the polygon client
-#client=RESTClient(api_key=POLYGON_API_KEY)
+
 def get_client(api_key=None):
     """Returns a Polygon client with the specified or default API key"""
+    from polygon import RESTClient  # lazy: importing this module must not need a key
     return RESTClient(api_key=api_key or POLYGON_API_KEY)
+
+
+def bars_to_dataframe(bars):
+    """Converts Polygon agg bars (or any objects with the same attributes) to an OHLCV DataFrame."""
+    df = pd.DataFrame([{
+        'timestamp': pd.to_datetime(bar.timestamp, unit='ms'),
+        'open'     : bar.open,
+        'high'     : bar.high,
+        'low'      : bar.low,
+        'close'    : bar.close,
+        'volume'   : bar.volume
+    } for bar in bars])
+    if df.empty:
+        return df
+    df.set_index('timestamp', inplace=True)
+    df.sort_index(inplace=True)
+    return df
 
 
 def get_historical_data(ticker, start, end, timespan="day", api_key=None):
@@ -29,46 +46,30 @@ def get_historical_data(ticker, start, end, timespan="day", api_key=None):
         to=end,
         limit=50000
     )
-    #conversion of bars to dataframe
-    df = pd.DataFrame([{
-        'timestamp': pd.to_datetime(bar.timestamp, unit='ms'),
-        'open'     : bar.open,
-        'high'     : bar.high,
-        'low'      : bar.low,
-        'close'    : bar.close,
-        'volume'   : bar.volume
-    } for bar in bars])
-
-    df.set_index('timestamp', inplace=True)
-    df.sort_index(inplace=True)
-    return df
+    return bars_to_dataframe(bars)
 
 
-def get_latest_bar(ticker, timespan="day", api_key=None):
+def get_latest_bar(ticker, timespan="day", api_key=None, lookback_days=200):
     """
-    Fetches the most recent price bar for live trading and is used by the bots to make real time decisions
-    ticker: e.g. "SPY" or "AAPL", basically what the bots are invested in
-    Returns: single rowed pandas dataframe
-    """
+    Fetches the most recent `lookback_days` of bars for live trading (the
+    strategies need history for rolling indicators).
+    Returns a DataFrame sorted oldest -> newest, or None if empty.
 
-    #set dates
+    NOTE (audit issue 4.5): on Polygon's free tier the last DAILY bar is the
+    previous session's close, so `df['close'].iloc[-1]` is a stale signal
+    price, not a live quote.
+    """
     end   = datetime.today().strftime('%Y-%m-%d')
-    start = (datetime.today() - timedelta(days=200)).strftime('%Y-%m-%d')#/ doesn't work idk why, prob a python thing
+    start = (datetime.today() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
     df    = get_historical_data(ticker, start, end, timespan, api_key=api_key)
-    
-    #set the dataframe with historical data
-  #  df=get_historical_data(ticker,start,end,timespan)
 
-    #if no data in df, send a warning
     if df.empty:
         print(f"Warning, No data is in df for {ticker}")
         return None
-    #return only the most recent row
     return df
 
-import time
-#adding a sleep function
-def get_multiple_tickers(tickers, start, end, timespan="day", api_key=None):
+
+def get_multiple_tickers(tickers, start, end, timespan="day", api_key=None, delay=12):
     """Fetch hisotrical data for multiple tickers with a rate limit delay of 12 to prevent rate limiting"""
     data = {}
     for t in tickers:
@@ -78,11 +79,10 @@ def get_multiple_tickers(tickers, start, end, timespan="day", api_key=None):
             data[t] = df
         else:
             print(f"Warning: no data for {t}, skipping")
-        time.sleep(12)
+        time.sleep(delay)
     return data
 
 
-#Adding crypto detector and crypto latest bar function
 def is_crypto(ticker):
     """
     Checks if a ticker is a crypto pair, if it is use X: prefix for polygon
@@ -90,11 +90,13 @@ def is_crypto(ticker):
     """
     return ticker.startswith("X:")
 
+
 def get_latest_price(ticker, api_key=None):
     """
-    Works for both stocks and crypto, and Automatically handles the X: prefix for crypto
+    Latest available close for stocks or crypto.
+    BUG FIXED: previously returned `.iloc[0]`, the OLDEST bar in the window.
     """
     bar = get_latest_bar(ticker, api_key=api_key)
     if bar is None:
         return None
-    return bar['close'].iloc[0]
+    return float(bar['close'].iloc[-1])

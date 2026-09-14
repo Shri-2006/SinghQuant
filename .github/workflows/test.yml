@@ -9,37 +9,40 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # Same recipe as setup.sh: compatible ranges, CPU torch, alpaca without
+        # its stale dependency pins. 3.11 additionally verifies the pinned set.
         run: |
-          pip install aiohttp>=3.9.0
-          pip install alpaca-trade-api==3.0.0 --no-deps
-          pip install "websockets>=14.0"
-          pip install pandas==2.3.3 numpy==2.2.6 ta==0.11.0 feedparser==6.0.12
-          pip install requests==2.33.1 python-dateutil pytz tzdata
-          pip install scikit-learn==1.7.2 xgboost==3.2.0
-          pip install stable-baselines3==2.8.0 gymnasium==1.2.3
-          pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install vectorbt==0.28.5 streamlit==1.56.0 plotly==6.7.0
-          pip install APScheduler==3.11.2 python-dotenv==1.2.2 pytest==9.0.3
-          pip install google-genai==1.73.0 textblob==0.20.0
-          pip install polygon-api-client==1.16.3
-          pip install msgpack==1.0.3 websocket-client PyYAML==6.0.1 deprecation
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.python-version }}" = "3.11" ]; then
+            python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+            python -m pip install -r requirements-py311-pinned.txt
+          else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install "alpaca-trade-api==3.0.0" --no-deps
+          python -m pip install msgpack websocket-client PyYAML deprecation aiohttp "websockets>=10"
 
       - name: Run tests
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -q --deselect tests/test_regime.py::TestVIXSignal::test_get_vix_returns_float_or_none
         env:
           POLYGON_API_KEY: test_key
           ALPACA_API_KEY: test_key
           ALPACA_SECRET_KEY: test_key
 
-
-#using test keys because github actions doesn't use env files, so the polygon client would crash at improt if we didn't have test keys (for test_backetesting.py)
+# Dummy keys: tests never call external APIs. The one network-dependent test
+# (live VIX fetch from FRED) is deselected so CI cannot fail on connectivity.

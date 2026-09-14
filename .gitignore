@@ -42,3 +42,8 @@ __pycache__/
 .env
 *.pkl
 trades.db
+
+# Trade-log exports used for audits (contain the account's full trade history)
+*_export.csv
+
+*.csv

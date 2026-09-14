@@ -13,23 +13,26 @@ HALT_DRAWDOWN_P= 0.12  # 12% then no new trades
 #Should map the state name to the position size multipier.
 TRADING_STATES = {"FULL": 1.0,"THROTTLE": 0.5,"HALT":0.0,}
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'trades.db') #position of database
+from core.logger import DB_PATH  # same database as the trade log (honours SINGHQUANT_DB_PATH)
+
+# Only genuine closing trades carry a dollar pnl. KILL_SWITCH rows historically
+# stored a drawdown FRACTION in the pnl column (audit issue M-04), so they are
+# excluded here rather than added to a dollar running total.
+CLOSING_ACTIONS = ("SELL",)
 
 
-
-
-def _fetch_equity_history(strategy: str, n: int = HISTORY_WINDOW) -> list[float]:
+def _fetch_equity_history(strategy: str, n: int = HISTORY_WINDOW, db_path: str = None) -> list[float]:
     """
     This function should reconstruct the equity curve from closed traders per strategy. (equity=starting capital+cumulative profit/loss(pnl) over the last n closed trades, where n is  a selected amoutn of trades. Trades where profit/loss is null is not counted (except open positions)) This will return a list of quity values from oldest to newest.
     """
-    syst=sqlite3.connect(DB_PATH)
+    syst=sqlite3.connect(db_path or DB_PATH, timeout=30)
     cursor=syst.cursor()
-    cursor.execute('''SELECT pnl FROM trades
-                   WHERE strategy =? AND pnl IS NOT NULL
-                   ORDER BY timestamp DESC
+    placeholders = ",".join("?" for _ in CLOSING_ACTIONS)
+    cursor.execute(f'''SELECT pnl FROM trades
+                   WHERE strategy =? AND pnl IS NOT NULL AND action IN ({placeholders})
+                   ORDER BY id DESC
                    LIMIT ?
-                   
-                   ''',(strategy,n))
+                   ''',(strategy,*CLOSING_ACTIONS,n))
     rows=cursor.fetchall()
     syst.close()
 
@@ -42,6 +45,8 @@ def _fetch_equity_history(strategy: str, n: int = HISTORY_WINDOW) -> list[float]
     equity_curve=[]
     running_total=starting_capital
     for pnl in pnls:
+        if pnl is None or not np.isfinite(pnl):
+            continue
         running_total += pnl
         equity_curve.append(running_total)
 
@@ -74,7 +79,7 @@ def _compute_drawdown(values: list[float]) -> float:
 
 # Public interface for everyone
 
-def get_trading_state(strategy: str) -> tuple[str, float]:
+def get_trading_state(strategy: str, db_path: str = None) -> tuple[str, float]:
     """
     Master function — call this before placing any trade.
     Pulls equity history, computes MA and drawdown, then returns:
@@ -87,8 +92,11 @@ def get_trading_state(strategy: str) -> tuple[str, float]:
         - Equity < its MA then HROTTLE (cold streak)
         - Drawdown > 5% then THROTTLE (approaching danger)
         - Otherwise do FULL
+
+    NOTE: HALT means "no NEW positions". Callers must still evaluate exits
+    (stop loss, momentum exit, kill switch) while halted; see audit issue H-05.
     """
-    equity_curve = _fetch_equity_history(strategy)
+    equity_curve = _fetch_equity_history(strategy, db_path=db_path)
 
     # Not enough data yet — trade normally, don't penalize early on
     if len(equity_curve) < 2:

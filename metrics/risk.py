@@ -2,10 +2,25 @@ import numpy as np
 import pandas as pd
 
 
+import time as _time
+
+DEFAULT_RISK_FREE_RATE = 0.04
+_rf_cache = {"rate": None, "ts": 0.0}
+RISK_FREE_CACHE_SECONDS = 6 * 3600
+
+
 def get_risk_free_rate():
     """
-    this will give the current us 10 year treasury yield from polygon.io. If the fetch fails it falls back to 4% as a default. 10 year industry is chosen becaause it is the industry standard of risk-free rates
+    Current US 10-year treasury yield, cached for 6 hours; falls back to 4%.
+
+    NOTE (audit, LOW): Polygon's `get_last_trade("I:TNX")` is an index with no
+    trades, so this has always fallen back to 4%. The result is now cached so
+    the dashboard does not make a failing network call on every metric.
     """
+    now = _time.time()
+    if _rf_cache["rate"] is not None and now - _rf_cache["ts"] < RISK_FREE_CACHE_SECONDS:
+        return _rf_cache["rate"]
+    rate = DEFAULT_RISK_FREE_RATE
     try:
         from polygon import RESTClient
         from core.config import POLYGON_API_KEY
@@ -14,10 +29,10 @@ def get_risk_free_rate():
         data=client.get_last_trade("I:TNX")
         rate=data.price/100
         print(f"Current risk-free rate that is fetched is : {data.price:.2f}%")
-        return rate
     except Exception as e:
-        print(f"WARNING AND ERROR, falling back to default rate of 4% since treasury rate could not be fetched \n\n error code is: {e}")
-        return 0.04
+        print(f"WARNING, falling back to default rate of 4% since treasury rate could not be fetched: {e}")
+    _rf_cache.update(rate=rate, ts=now)
+    return rate
     
 
 

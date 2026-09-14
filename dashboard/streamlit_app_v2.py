@@ -107,8 +107,13 @@ with tab1:
 
         else:
             df_t=pd.DataFrame(trades, columns=['id','timestamp','strategy','asset','action','price','quantity','pnl','reason'])
-            df_t['pnl'] =pd.to_numeric(df_t['pnl'],errors='coerce').fillna(0)
-            returns = df_t['pnl']
+            closed = df_t[df_t['action'] == 'SELL'].copy()
+            closed['pnl'] = pd.to_numeric(closed['pnl'], errors='coerce')
+            closed = closed[closed['pnl'].notna()]
+            # per-trade returns as a fraction of strategy capital (metrics expect fractions, not dollars)
+            returns = (closed['pnl'] / CAPITAL[strategy]).reset_index(drop=True)
+            if returns.empty:
+                returns = pd.Series([0.0])
             metrics =compute_all_metrics(returns)
             rows.append({ 
                 "Strategy": strategy.upper(),
@@ -189,22 +194,34 @@ with tab2:
 with tab3:
     st.title("Risk & Positions")
     try:
+        from core import portfolio
         api = get_api("stable")
-        account = api.get_account()
-        equity = float(account.equity)
-        # kill switches per strat
-        st.subheader("Kill Switch Status")
+        # Mark each strategy's OWN ledger with the broker's current prices.
+        broker_px = {}
+        try:
+            for p in api.list_positions():
+                broker_px[p.symbol] = float(p.current_price)
+        except Exception:
+            pass
+        # kill switches per strategy: drawdown from the STRATEGY's persisted peak
+        # (the old panel compared ACCOUNT equity with each strategy's capital)
+        st.subheader("Kill Switch Status (per strategy)")
         cols = st.columns(3)
         for i, strategy in enumerate(STRATEGIES):
             with cols[i]:
-                start = CAPITAL[strategy]
-                drawdown_pct = (equity - start) / start
+                state = portfolio.get_strategy_state(strategy)
+                marks = {sym: broker_px.get(sym.replace("X:", ""), None) for sym in portfolio.list_positions(strategy)}
+                equity, pos_value, _ = portfolio.strategy_equity(strategy, {k: v for k, v in marks.items() if v})
+                peak = max(state["peak_equity"], equity)
+                drawdown_pct = (equity - peak) / peak if peak else 0.0
                 warning = WARNING_DRAWDOWN[strategy]
                 critical = MAX_DRAWDOWN[strategy]
                 progress = min(drawdown_pct / critical, 1.0) if critical != 0 else 0
                 progress = max(progress, 0.0)
 
-                if drawdown_pct <= critical:
+                if state["halted"]:
+                    label = "⛔ HALTED (kill switch)"
+                elif drawdown_pct <= critical:
                     label = "🔴CRITICAL"
                 elif drawdown_pct <= warning:
                     label = "🟡WARNING"
@@ -212,11 +229,25 @@ with tab3:
                     label = "🟢 SAFE"
 
                 st.markdown(f"**{strategy.upper()}** — {label}")
-                st.markdown(f"Drawdown: `{drawdown_pct:.2%}`")
+                st.markdown(f"Equity: `${equity:,.2f}` (cash `${state['cash_budget']:,.2f}` + positions `${pos_value:,.2f}`)")
+                st.markdown(f"Drawdown from peak `${peak:,.2f}`: `{drawdown_pct:.2%}`")
                 st.progress(progress)
 
-        #Live pos
-        st.subheader("Live Positions")
+        st.subheader("Strategy Ledger (who owns what)")
+        ledger_rows = []
+        for strategy in STRATEGIES:
+            for sym, (qty, avg, opened) in portfolio.list_positions(strategy).items():
+                px = broker_px.get(sym.replace("X:", ""))
+                ledger_rows.append({"Strategy": strategy.upper(), "Symbol": sym, "Qty": qty,
+                                    "Avg Entry": f"${avg:,.2f}", "Mark": f"${px:,.2f}" if px else "n/a",
+                                    "Unrealized": f"${qty * (px - avg):+,.2f}" if px else "n/a", "Opened": opened})
+        if ledger_rows:
+            st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True)
+        else:
+            st.info("No strategy-owned positions")
+
+        #Live pos (account-wide, as Alpaca sees it)
+        st.subheader("Broker Positions (account-wide)")
         positions = api.list_positions()
         if not positions:
             st.info("No active positions")

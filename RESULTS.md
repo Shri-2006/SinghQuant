@@ -1,5 +1,7 @@
 # SinghQuant — Live Trading Results
 
+> **Audit note (2026-09-14):** the "Backtest Results" tables below were produced by running the model over the same two-year window it was trained on, so they are **in-sample** and overstate expected performance. `backtesting/run_backtest.py` now evaluates the chronological hold-out tail by default. The paper-trading figures come from the trade log, whose SELL rows at that time recorded dollar market value in the `quantity` column (see ENGINEERING_AUDIT.md). The historical content is preserved unchanged below.
+
 ## Paper Trading Period: April 15 – June 2, 2026 (48 days)
 
 ### Stable Bot Performance

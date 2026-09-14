@@ -2,13 +2,49 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-from core.features import build_features
-from data.sentiment_fetcher import add_sentiment_to_df
+
+OHLCV = ['open', 'high', 'low', 'close', 'volume']
+
+
+def feature_columns(df):
+    """Feature columns for the RL observation: everything except raw OHLCV."""
+    return [c for c in df.columns if c not in OHLCV]
+
+
+def build_observation(row, feature_cols, position_value, entry_price, initial_capital):
+    """
+    Builds the observation vector for ONE bar. Shared by training
+    (TradingEnvironment._get_observation) and live inference (strategies/risky2)
+    so both see exactly the same layout:
+        [features..., position_value / initial_capital, unrealized_pnl_fraction]
+    """
+    features = row[feature_cols].values.astype(np.float32)
+    position_norm = float(position_value) / float(initial_capital)
+    unrealized = 0.0
+    if position_value > 0 and entry_price and entry_price > 0:
+        unrealized = (float(row['close']) - float(entry_price)) / float(entry_price)
+    return np.append(features, [position_norm, unrealized]).astype(np.float32)
+
+
+def build_live_observation(df, position_value, entry_price, initial_capital):
+    """
+    Live inference helper (audit issue H-04): uses the LATEST row of `df` and
+    the strategy's real position state. The original code reset a fresh
+    environment and observed row 0, the oldest bar in the window, with a
+    zero position.
+    """
+    if df is None or len(df) == 0:
+        raise ValueError("empty dataframe")
+    obs = build_observation(df.iloc[-1], feature_columns(df), position_value, entry_price, initial_capital)
+    if not np.isfinite(obs).all():
+        raise ValueError("observation contains NaN or inf")
+    return obs
+
 
 class TradingEnvironment(gym.Env):
     """
     Custom Gymnasium trading environment for risky2 RL bot.
-    
+
     State: price features + current position + unrealized PnL
     Actions: 0=HOLD, 1=BUY, 2=SELL
     Reward: realized PnL with incentives to buy and hold winners,
@@ -35,8 +71,7 @@ class TradingEnvironment(gym.Env):
 
     def _get_feature_cols(self):
         """Returns feature columns — excludes raw OHLCV"""
-        return [c for c in self.df.columns
-                if c not in ['open', 'high', 'low', 'close', 'volume']]
+        return feature_columns(self.df)
 
     def reset(self, seed=None, options=None):
         """Reset environment to starting state for new episode"""
@@ -53,27 +88,19 @@ class TradingEnvironment(gym.Env):
 
     def _get_observation(self):
         """Build the state vector the agent sees"""
-        row          = self.df.iloc[self.current_step]
-        feature_cols = self._get_feature_cols()
-        features     = row[feature_cols].values.astype(np.float32)
-
-        position_norm  = self.position / self.initial_capital
-        unrealized_pnl = 0.0
-        if self.position > 0 and self.entry_price > 0:
-            current_price  = float(row['close'])
-            unrealized_pnl = (current_price - self.entry_price) / self.entry_price
-
-        return np.append(features, [position_norm, unrealized_pnl]).astype(np.float32)
+        row = self.df.iloc[self.current_step]
+        return build_observation(row, self._get_feature_cols(), self.position, self.entry_price, self.initial_capital)
 
     def step(self, action):
         """
         Execute one trading action and return new state, reward, done flag.
-        
+
         Reward design:
         - BUY:  small positive reward to encourage exploration
         - SELL: realized PnL as reward (positive or negative)
         - HOLD with position: reward unrealized gains, penalize unrealized losses
         - HOLD without position when price is rising: small penalty for missing opportunity
+          (this uses the NEXT bar's price: hindsight reward shaping, not an observation leak)
         """
         row   = self.df.iloc[self.current_step]
         price = float(row['close'])

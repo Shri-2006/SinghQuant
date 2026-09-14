@@ -1,49 +1,64 @@
-import os
 import time
-import threading #i want the bots to run side by side so that the run_stable and run_risky1 both start (since they run infintely)
+import threading  # bots run side by side; each strategy loops forever in its own thread
+
+from core.config import FEATURE_FLAGS, PAPER_MODE, ALLOW_LIVE_TRADING
 from models.retrain import start_scheduler
-from strategies.stable import run as run_stable
-from strategies.risky1 import run as run_risky1
-from strategies.risky2 import run as run_risky2
-from paper_trading.alpaca_paper import is_market_open
-from core.config import FEATURE_FLAGS
+from paper_trading.alpaca_paper import resolve_base_url
+
+
+def preflight():
+    """Refuses to start if any strategy would reach a live endpoint without opt-in."""
+    for s in ("stable", "risky1", "risky2"):
+        url = resolve_base_url(s)  # raises LiveTradingBlocked if misconfigured
+        mode = "PAPER" if PAPER_MODE[s] else "LIVE (explicit opt-in)"
+        print(f"  {s:7s} -> {mode}: {url}")
+    if ALLOW_LIVE_TRADING:
+        print("  WARNING: live-trading opt-in is set in the environment")
+
 
 def main():
     """
-    This will be the main function. it starts the tradingsystem through these steps
-    In the background it starts retraining scheduler
-    Launches stable and risky1 in separte threads
-    keeps main process alive
+    Starts the trading system:
+      * preflight check that every strategy targets the paper endpoint
+      * background retraining scheduler
+      * one daemon thread per enabled strategy
+      * keeps the main process alive
     """
     print("="*50)
-    print(" Trading System Starting....")
+    print(" SinghQuant Trading System Starting....")
     print("="*50)
+    preflight()
 
-    #retraining scheduler start background
-    scheduler=start_scheduler()
+    scheduler = start_scheduler()
 
-    #separate threads per bbot
-    stable_thread=threading.Thread(target=run_stable,daemon=True, name="stable")
-    risky1_thread=threading.Thread(target=run_risky1,daemon=True,name="risky1")
-    risky2_thread=threading.Thread(target=run_risky2,daemon=True,name="risky2")
-    
-    stable_thread.start()
-    print("Stable strat bot thread has started")
-    risky1_thread.start()
-    print("Risky1 strat bot threat started")
-    if FEATURE_FLAGS["risky2_enabled"]==True:
-        risky2_thread.start()
-        print("Risky2 RL bot for crypto thread is started")
-        #Keeping the main procecss alive
+    from strategies.stable import run as run_stable
+    from strategies.risky1 import run as run_risky1
+
+    threads = [
+        threading.Thread(target=run_stable, daemon=True, name="stable"),
+        threading.Thread(target=run_risky1, daemon=True, name="risky1"),
+    ]
+    if FEATURE_FLAGS["risky2_enabled"]:
+        from strategies.risky2 import run as run_risky2
+        threads.append(threading.Thread(target=run_risky2, daemon=True, name="risky2"))
     else:
-        print("risky2 rl bot is currently disabled in config.py, enable it when model is trained")
+        print("risky2 RL bot is disabled in config.py (FEATURE_FLAGS); enable it once models are trained")
+
+    for t in threads:
+        t.start()
+        print(f"{t.name} strategy thread started")
+
     try:
         while True:
             time.sleep(60)
+            dead = [t.name for t in threads if not t.is_alive()]
+            if dead:
+                print(f"WARNING: strategy thread(s) exited: {dead}")
     except KeyboardInterrupt:
-        print("\nShutting down TradingSystem due to user input...")
+        print("\nShutting down SinghQuant due to user input...")
         scheduler.shutdown()
         print("Scheduler has stopped. Goodbye for now!")
+
 
 if __name__ == "__main__":
     main()

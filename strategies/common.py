@@ -26,12 +26,13 @@ import numpy as np
 
 from core import portfolio
 from core.config import (CAPITAL, MAX_POSITION_SIZE, MIN_HOLD_SECONDS, ONE_ACTION_PER_BAR,
-                         KILL_SWITCH_CONFIRMATIONS, STRATEGY_ASSETS, MIN_TOPUP_FRACTION)
+                         KILL_SWITCH_CONFIRMATIONS, STRATEGY_ASSETS, MIN_TOPUP_FRACTION,
+                         MARK_MAX_STEP_CHANGE, STALE_BAR_MAX_DAYS, MARK_CROSSCHECK_TOLERANCE)
 from core.execution import (submit_and_track, close_strategy_position, close_all_strategy_positions,
                             reconcile_open_orders, to_broker_symbol)
 from core.logger import log_trade, log_heartbeat
 from metrics.risk_manager import (atr_as_fraction, risk_level_from_drawdown, get_position_size,
-                                  check_stop_loss, validate_equity)
+                                  check_stop_loss, validate_equity, portfolio_atr_fraction)
 
 MIN_ORDER_NOTIONAL = 1.0  # Alpaca minimum for fractional orders
 
@@ -52,6 +53,10 @@ class RiskSnapshot:
     kill_now: bool
     halted: bool
     reason: str = ""
+    accepted_marks: dict = field(default_factory=dict)   # validated marks used for valuation this cycle
+    suspect_symbols: list = field(default_factory=list)  # symbols whose mark could not be validated
+    atr_fraction: Optional[float] = None                 # strategy-level ATR fraction used for thresholds
+    stale_symbols: list = field(default_factory=list)    # symbols whose latest bar is too old for entries
 
 
 @dataclass
@@ -72,8 +77,6 @@ class StrategyContext:
     alert: Callable[..., None] = lambda **kw: None                 # Discord alert
     db_path: Optional[str] = None
     exec_kw: dict = field(default_factory=dict)                    # e.g. sleep_fn/clock_fn for tests
-    # in-memory only: last rejected equity reading, used to confirm persistent moves
-    _last_suspect: Optional[float] = field(default=None, repr=False)
 
 
 def utcnow():
@@ -98,38 +101,153 @@ def bar_id(df):
         return None
 
 
+def _bar_age_days(df, now=None):
+    """Age in days of the latest bar (None if the index is not a timestamp)."""
+    try:
+        import pandas as pd
+        ts = pd.Timestamp(df.index[-1])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        ref = now or utcnow()
+        if getattr(ref, "tzinfo", None) is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        return (pd.Timestamp(ref) - ts).total_seconds() / 86400.0
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Risk evaluation (strategy-level, confirmed kill switch)
 # ---------------------------------------------------------------------------
 
-def evaluate_risk(ctx, marks, now=None):
+def _validate_marks(ctx, marks, bar_ages, verify_mark):
     """
-    Computes THIS strategy's equity from its ledger, validates the reading,
-    updates the persisted peak, and decides the risk level. The kill switch
-    only fires after KILL_SWITCH_CONFIRMATIONS consecutive critical readings.
+    Per-symbol INPUT validation (third pass T-06). A mark that jumped more than
+    MARK_MAX_STEP_CHANGE from the last accepted mark (or the entry price when
+    never marked), or that comes from a bar older than STALE_BAR_MAX_DAYS, is
+    trusted only if an independent broker quote agrees within
+    MARK_CROSSCHECK_TOLERANCE. If the broker quote disagrees, the broker quote
+    is used for this cycle. If no independent quote is available the symbol is
+    SUSPECT: it is valued at its last accepted mark and no action is taken on it.
+    Two identical bad bars therefore never "confirm" each other.
+    Returns (accepted_marks, suspect_symbols, notes).
+    """
+    s = ctx.name
+    positions = portfolio.list_positions(s, ctx.db_path)
+    last_marks = portfolio.get_last_marks(s, ctx.db_path)
+    accepted = dict(marks)
+    suspect, notes = [], []
+    for symbol, (qty, avg, _) in positions.items():
+        px = marks.get(symbol)
+        if px is None:
+            continue  # strategy_equity falls back to the last accepted mark (never zero)
+        ref = last_marks.get(symbol) or avg
+        age = (bar_ages or {}).get(symbol)
+        problems = []
+        if ref and ref > 0 and abs(px - ref) / ref > MARK_MAX_STEP_CHANGE:
+            problems.append(f"mark {px:.4f} moved {abs(px - ref) / ref:.0%} from last accepted {ref:.4f}")
+        if age is not None and age > STALE_BAR_MAX_DAYS:
+            problems.append(f"bar is {age:.1f} days old")
+        if not problems:
+            continue
+        quote = None
+        if verify_mark is not None:
+            try:
+                quote = verify_mark(symbol)
+                quote = float(quote) if quote is not None else None
+            except Exception:
+                quote = None
+        if quote is not None and math.isfinite(quote) and quote > 0:
+            if abs(quote - px) / quote <= MARK_CROSSCHECK_TOLERANCE:
+                notes.append(f"{symbol}: {'; '.join(problems)}; independent quote {quote:.4f} agrees, accepted")
+            else:
+                accepted[symbol] = quote
+                notes.append(f"{symbol}: {'; '.join(problems)}; independent quote {quote:.4f} disagrees, using it")
+            continue
+        accepted.pop(symbol, None)
+        suspect.append(symbol)
+        notes.append(f"{symbol}: {'; '.join(problems)}; no independent quote, SUSPECT")
+    return accepted, suspect, notes
+
+
+def evaluate_risk(ctx, marks, now=None, atr_fractions=None, bar_ages=None, verify_mark=None):
+    """
+    Computes THIS strategy's equity from its ledger, validates the INPUT marks
+    (T-06), updates the persisted peak, and decides the risk level with the
+    strategy-level ATR-adjusted thresholds (T-02). The kill switch only fires
+    after KILL_SWITCH_CONFIRMATIONS consecutive critical readings.
+
+    Two independent guards, on purpose:
+      * input validation (per mark, cross-checked against the broker) decides
+        whether the equity number can be trusted at all;
+      * state confirmation (consecutive critical readings) decides whether a
+        trusted critical equity is acted on.
     """
     s = ctx.name
     state = portfolio.get_strategy_state(s, ctx.db_path)
-    equity, pos_value, missing = portfolio.strategy_equity(s, marks, ctx.db_path)
+    accepted, suspect, notes = _validate_marks(ctx, marks, bar_ages, verify_mark)
+    for n in notes:
+        print(f"[{s}] mark check: {n}")
+    stale = sorted(t for t, a in (bar_ages or {}).items() if a is not None and a > STALE_BAR_MAX_DAYS)
+    equity, pos_value, missing = portfolio.strategy_equity(s, accepted, ctx.db_path)
     if missing:
-        print(f"[{s}] no mark price for {missing}; valued at entry (conservative)")
+        print(f"[{s}] no validated mark for {missing}; valued at last accepted mark / entry (conservative)")
 
-    ok, why = validate_equity(equity, state["last_equity"])
-    if not ok:
-        # A persistent reading (two cycles agreeing) is reality, not a glitch.
-        if ctx._last_suspect is not None and abs(equity - ctx._last_suspect) <= 0.05 * max(abs(equity), 1e-9):
-            ok, why = True, "confirmed by consecutive reading"
-        else:
-            ctx._last_suspect = equity
-            print(f"[{s}] SUSPECT equity reading {equity:.2f} ({why}); no entries, no kill switch this cycle")
-            portfolio.record_equity_snapshot(s, equity, state["cash_budget"], pos_value,
-                                             state["peak_equity"], float("nan"), "suspect", ctx.db_path)
-            return RiskSnapshot(equity, state["peak_equity"], float("nan"), "suspect", False, state["halted"], why)
-    ctx._last_suspect = None
+    structurally_ok = isinstance(equity, (int, float)) and math.isfinite(equity)
+    if suspect or not structurally_ok:
+        reason = f"unvalidated marks for {suspect}" if suspect else "equity not finite"
+        print(f"[{s}] SUSPECT reading ({reason}); no entries, no kill switch this cycle")
+        portfolio.record_equity_snapshot(s, equity if structurally_ok else 0.0, state["cash_budget"], pos_value,
+                                         state["peak_equity"], None, "suspect", ctx.db_path)
+        return RiskSnapshot(equity, state["peak_equity"], float("nan"), "suspect", False, state["halted"], reason,
+                            accepted, suspect, None, stale)
+
+    portfolio.set_last_marks(s, accepted, ctx.db_path)
+    held = portfolio.list_positions(s, ctx.db_path)
+    position_values = {t: q * accepted[t] for t, (q, _, _) in held.items() if t in accepted}
+    atr_frac = portfolio_atr_fraction(position_values, atr_fractions or {})
 
     peak = max(state["peak_equity"], equity)
     drawdown = (equity - peak) / peak if peak > 0 else 0.0
-    level = risk_level_from_drawdown(s, drawdown, None)
+    level = risk_level_from_drawdown(s, drawdown, atr_frac)
+
+    if level == "critical" and verify_mark is not None and held:
+        # A CRITICAL state is acted on only when an independent quote corroborates
+        # every held mark (T-06): a bad print inside the step limit must not be
+        # able to confirm itself across cycles. Disagreeing quotes replace the
+        # marks; an unavailable quote makes the reading suspect (fail closed).
+        corrected, unverifiable = {}, []
+        for t in held:
+            if t not in accepted:
+                continue
+            try:
+                q = verify_mark(t)
+                q = float(q) if q is not None else None
+            except Exception:
+                q = None
+            if q is None or not math.isfinite(q) or q <= 0:
+                unverifiable.append(t)
+            elif abs(q - accepted[t]) / q > MARK_CROSSCHECK_TOLERANCE:
+                corrected[t] = q
+        if unverifiable:
+            reason = f"critical reading could not be corroborated for {unverifiable}"
+            print(f"[{s}] SUSPECT reading ({reason}); no entries, no kill switch this cycle")
+            portfolio.record_equity_snapshot(s, equity, state["cash_budget"], pos_value,
+                                             state["peak_equity"], None, "suspect", ctx.db_path)
+            return RiskSnapshot(equity, state["peak_equity"], float("nan"), "suspect", False, state["halted"],
+                                reason, accepted, unverifiable, atr_frac, stale)
+        if corrected:
+            for t, q in corrected.items():
+                print(f"[{s}] mark check: {t} critical-state corroboration disagrees ({accepted[t]:.4f} vs {q:.4f}); using quote")
+            accepted.update(corrected)
+            portfolio.set_last_marks(s, accepted, ctx.db_path)
+            equity, pos_value, missing = portfolio.strategy_equity(s, accepted, ctx.db_path)
+            position_values = {t: q * accepted[t] for t, (q, _, _) in held.items() if t in accepted}
+            atr_frac = portfolio_atr_fraction(position_values, atr_fractions or {})
+            peak = max(state["peak_equity"], equity)
+            drawdown = (equity - peak) / peak if peak > 0 else 0.0
+            level = risk_level_from_drawdown(s, drawdown, atr_frac)
+
     streak = state["critical_streak"] + 1 if level == "critical" else 0
     kill_now = level == "critical" and streak >= KILL_SWITCH_CONFIRMATIONS
     portfolio.update_strategy_state(s, ctx.db_path, peak_equity=peak, last_equity=equity, critical_streak=streak)
@@ -138,7 +256,7 @@ def evaluate_risk(ctx, marks, now=None):
         print(f"[{s}] CRITICAL drawdown {drawdown:.2%} (reading {streak}/{KILL_SWITCH_CONFIRMATIONS}); awaiting confirmation")
     elif level == "warning":
         print(f"[{s}] WARNING drawdown {drawdown:.2%} from peak ${peak:.2f}; reducing position size")
-    return RiskSnapshot(equity, peak, drawdown, level, kill_now, state["halted"])
+    return RiskSnapshot(equity, peak, drawdown, level, kill_now, state["halted"], "", accepted, [], atr_frac, stale)
 
 
 def fire_kill_switch(ctx, api, risk, marks):
@@ -221,6 +339,14 @@ def trade_ticker(ctx, api, ticker, df, risk, multiplier=1.0, vix=None, allow_ent
     if price is None or price <= 0:
         print(f"[{s}] invalid price for {ticker}; skipping")
         return "bad-price"
+    if ticker in getattr(risk, "suspect_symbols", ()):
+        # The bar's price could not be validated and no independent quote exists:
+        # act on nothing for this symbol (no stop, no signal) this cycle (T-06).
+        print(f"[{s}] {ticker}: mark could not be validated this cycle; no action")
+        return "suspect-mark"
+    # Risk decisions use the validated mark, which may be the broker quote when
+    # the bar disagreed with it.
+    price = (getattr(risk, "accepted_marks", None) or {}).get(ticker, price)
     atr_frac = atr_as_fraction(_last_float(df, "atr"), price)
     current_bar = bar_id(df)
 
@@ -269,10 +395,18 @@ def trade_ticker(ctx, api, ticker, df, risk, multiplier=1.0, vix=None, allow_ent
     # 5. Sizing against STRATEGY equity and peak.
     base_size = MAX_POSITION_SIZE[s] * multiplier
     max_pos = get_position_size(s, risk.equity, base_size, atr_frac, risk.peak)
+    # The strategy-level decision (T-02) is authoritative: a per-ticker ATR may
+    # widen a ticker's own threshold, but it can never undo a strategy-level
+    # warning or critical state.
+    if risk.level == "warning":
+        max_pos = min(max_pos, base_size / 2)
     if risk.level in ("critical", "suspect"):
         max_pos = 0.0
 
     if decision.signal == "BUY":
+        if ticker in getattr(risk, "stale_symbols", ()):
+            print(f"[{s}] {ticker} BUY signal ignored: latest bar is stale")
+            return "stale-bar"
         if not allow_entries or max_pos <= 0:
             print(f"[{s}] {ticker} BUY signal ignored: entries disabled (risk={risk.level}, entries={allow_entries})")
             return "entry-blocked"
@@ -397,8 +531,19 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
             sleep_fn(ctx.per_ticker_sleep)
     marks = {t: _last_float(df, "close") for t, df in frames.items() if df is not None and len(df)}
     marks = {t: p for t, p in marks.items() if p and p > 0}
+    atr_fracs = {t: atr_as_fraction(_last_float(df, "atr"), marks.get(t))
+                 for t, df in frames.items() if df is not None and len(df)}
+    bar_ages = {t: _bar_age_days(df, now) for t, df in frames.items() if df is not None and len(df)}
 
-    risk = evaluate_risk(ctx, marks, now)
+    def verify_mark(symbol):
+        # Independent quote from the broker's own position record; None if unavailable.
+        try:
+            return float(api.get_position(to_broker_symbol(symbol)).current_price)
+        except Exception:
+            return None
+
+    risk = evaluate_risk(ctx, marks, now, atr_fractions=atr_fracs, bar_ages=bar_ages, verify_mark=verify_mark)
+    marks = risk.accepted_marks or marks
     summary["risk"] = risk
     if risk.halted:
         log_heartbeat(s, "HALTED", ctx.db_path)

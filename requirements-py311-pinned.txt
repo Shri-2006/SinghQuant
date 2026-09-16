@@ -1,7 +1,12 @@
 # Original exact pins from the last deployment (Python 3.11, Oracle ARM).
 # Kept verbatim so the Docker image reproduces the environment the historical
 # results were produced on. numpy 2.2.6 has no wheels for Python 3.14; use
-# requirements.txt on newer interpreters.
+# the split requirements-*.txt files on newer interpreters.
+#
+# torch: on Linux, `torch==2.11.0` from PyPI pulls the CUDA build plus the
+# nvidia-* packages (several GB). Install torch first from the CPU index
+# (`setup.sh --pinned --with-rl` does this) so the pin resolves to 2.11.0+cpu.
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 # Data sources
 polygon-api-client==1.16.3

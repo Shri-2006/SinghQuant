@@ -188,13 +188,15 @@ def test_s05_fill_and_order_row_are_updated_atomically(db_path):
 
 # S-06 ----------------------------------------------------------------------
 
-def test_s06_dust_remainder_is_written_off_not_resubmitted(db_path):
+def test_s06_dust_remainder_is_not_resubmitted_every_cycle(db_path):
     api = FakeAlpaca(prices={"SPY": 500.0})
     api.seed_position("SPY", 0.001, 500.0)
     portfolio.adopt_position("stable", "SPY", 0.001, 500.0, db_path)   # $0.50 of dust
     res = close_strategy_position(api, "stable", "SPY", 500.0, "ML SELL", db_path=db_path, **FAST)
-    assert res.status == "reconciled" and api.submitted == []
-    assert portfolio.get_position_qty("stable", "SPY", db_path) == 0.0
+    assert res.status == "dust" and api.submitted == []
+    # third pass T-01: dust is NOT written off (the shares were not sold); it stays owned
+    # and no cash is credited. Exits simply skip it instead of resubmitting every cycle.
+    assert portfolio.get_position_qty("stable", "SPY", db_path) == pytest.approx(0.001)
 
 
 # S-07 ----------------------------------------------------------------------
@@ -237,7 +239,8 @@ def test_s09_halted_strategy_keeps_trying_to_flatten_leftover_positions(db_path)
     api = FakeAlpaca(prices={"SPY": 500.0})
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
     ctx = make_ctx("stable", api, {"SPY": None}, db_path=db_path)
-    evaluate_risk(ctx, {"SPY": 100.0}); risk = evaluate_risk(ctx, {"SPY": 100.0})
+    evaluate_risk(ctx, {"SPY": 100.0}, verify_mark=lambda s: 100.0)
+    risk = evaluate_risk(ctx, {"SPY": 100.0}, verify_mark=lambda s: 100.0)
     api.fill_mode = "reject"                                        # the emergency sell fails
     fire_kill_switch(ctx, api, risk, {"SPY": 100.0})
     assert portfolio.get_position_qty("stable", "SPY", db_path) == pytest.approx(0.4)

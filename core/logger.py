@@ -103,6 +103,32 @@ def _migrate(conn):
     conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_open ON orders(strategy, symbol, status)')
     if 'client_order_id' not in _existing_columns(conn, "orders"):
         conn.execute('ALTER TABLE orders ADD COLUMN client_order_id TEXT')
+    pos_cols = _existing_columns(conn, "positions")
+    if 'last_mark' not in pos_cols:
+        conn.execute('ALTER TABLE positions ADD COLUMN last_mark REAL')
+    if 'last_mark_at' not in pos_cols:
+        conn.execute('ALTER TABLE positions ADD COLUMN last_mark_at TEXT')
+    # Journal of every ledger mutation. Broker fills carry a broker_order_id;
+    # internal reconciliation events (WRITE_OFF_*) never do (third-pass T-05).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS ledger_events (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp        TEXT NOT NULL,
+            strategy         TEXT NOT NULL,
+            symbol           TEXT NOT NULL,
+            event_type       TEXT NOT NULL,
+            qty_delta        REAL NOT NULL,
+            cash_delta       REAL NOT NULL,
+            price            REAL,
+            avg_entry_before REAL NOT NULL,
+            qty_before       REAL NOT NULL,
+            qty_after        REAL NOT NULL,
+            reason           TEXT,
+            broker_order_id  TEXT,
+            extra            TEXT
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_ledger_events_sym ON ledger_events(strategy, symbol)')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS strategy_state (
             strategy        TEXT PRIMARY KEY,

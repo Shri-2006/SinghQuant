@@ -1,0 +1,22 @@
+# SinghQuant CORE paper-trading runtime (stable + risky1 + execution/ledger).
+# CPU-only, no torch, no RL, no backtesting, no dashboard. Verified to import
+# and run with the optional packages absent (tests/test_third_pass.py::test_t08).
+#
+# Alpaca is installed separately by setup.sh (see comment there).
+
+# Data sources
+polygon-api-client>=1.14,<2
+textblob>=0.18
+pandas>=2.2
+numpy>=1.26
+ta>=0.11
+feedparser>=6.0
+requests>=2.31
+
+# Supervised ML (XGBoost models for stable/risky1)
+scikit-learn>=1.4
+xgboost>=2.0
+
+# Scheduling / environment
+APScheduler>=3.10,<4
+python-dotenv>=1.0

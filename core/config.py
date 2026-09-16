@@ -144,11 +144,25 @@ MIN_HOLD_SECONDS = {
 }
 # Stable/risky1 trade on daily bars; the system may act at most once per
 # symbol per bar, and never re-enter on the bar it just exited.
+# Third pass (T-07): risky2 also acts once per bar. Its PPO policy observes its
+# own position, so on a static daily bar it can legitimately answer BUY when
+# flat and SELL when long, which is a guaranteed oscillator bounded only by the
+# 30-minute hold (2,700 round trips in the export). One action per bar is also
+# the training semantics: the environment steps once per bar.
 ONE_ACTION_PER_BAR = {
     "stable": True,
     "risky1": True,
-    "risky2": False,
+    "risky2": True,
 }
+
+# Mark-price validation (third pass T-06). A mark that moves more than
+# MARK_MAX_STEP_CHANGE from the last accepted mark for that symbol, or a bar
+# older than STALE_BAR_MAX_DAYS, is only accepted if an independent broker
+# quote agrees within MARK_CROSSCHECK_TOLERANCE. Otherwise the broker quote is
+# used when available, and the reading is "suspect" when it is not.
+MARK_MAX_STEP_CHANGE = 0.5
+STALE_BAR_MAX_DAYS = 5
+MARK_CROSSCHECK_TOLERANCE = 0.10
 
 # Seconds to wait for a market order to fill before treating it as pending.
 ORDER_FILL_TIMEOUT_SECONDS = 20

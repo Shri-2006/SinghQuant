@@ -7,16 +7,22 @@ This is the ONLY module that should submit or close orders. It guarantees:
     than the shared account holds after every OTHER strategy's claim is
     honoured (no shorting, no liquidating another strategy's inventory),
                                                        -> audit C-02, S-03
+  * UNKNOWN broker state is never treated as zero inventory: a sell or a
+    write-off happens only after an authoritative position lookup; a timeout,
+    5xx, rate limit or transport error refuses the action for this cycle,
+                                                       -> third pass T-03
   * a new order is refused while this strategy already has an open order for
     the symbol (no duplicate exposure from repeated signals or restarts),
                                                        -> audit H-06
   * every order carries a client_order_id written to the database BEFORE it
-    is sent, so an order whose broker id was never recorded (crash or network
-    timeout after the broker accepted it) is recovered by client id instead
-    of being forgotten,                                -> second pass S-01
+    is sent, so an order whose broker id was never recorded is recovered by
+    client id instead of being forgotten,              -> second pass S-01
   * fills, partial fills and rejections are read back from the broker and
     applied to the ledger in the same transaction that records them on the
     order row,                                         -> audit H-03/H-06, S-05
+  * internal reconciliation (inventory missing at the broker) goes through
+    portfolio.write_off, which is journaled separately from fills and can
+    never increase equity; unsellable dust is left alone,  -> third pass T-01
   * every quantity is a share/coin quantity; dollars are converted exactly
     once, in the strategy's sizing step.
 
@@ -38,6 +44,7 @@ TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "expired", "rejected", "
                      "replaced", "stopped", "suspended", "unknown_at_broker", "reconcile_error"}
 MIN_SELL_NOTIONAL = 1.0          # Alpaca will not accept a fractional order below $1
 UNRESOLVED_ORDER_MAX_AGE_HOURS = 48   # an order we cannot refresh for this long stops blocking
+ALPACA_POSITION_NOT_FOUND_CODE = 40410000
 
 
 def to_broker_symbol(symbol):
@@ -78,10 +85,66 @@ def _order_fill_state(order):
     return status, float(fq), (float(fp) if fp not in (None, "") else None)
 
 
+def _exc_status_code(exc):
+    """HTTP status of a broker exception, or None. alpaca_trade_api.APIError.status_code
+    is a property that returns None unless an HTTP response is attached; raw
+    requests.HTTPError carries it on .response."""
+    for getter in (lambda e: e.status_code, lambda e: e.response.status_code):
+        try:
+            code = getter(exc)
+        except Exception:
+            continue
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def _exc_alpaca_code(exc):
+    try:
+        code = exc.code
+    except Exception:
+        return None
+    return code if isinstance(code, int) else None
+
+
 def _is_not_found(exc):
+    """Order lookups: 404 / not-found text."""
     text = str(exc).lower()
-    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    return code == 404 or "404" in text or "not found" in text or "does not exist" in text
+    return _exc_status_code(exc) == 404 or "not found" in text or "does not exist" in text
+
+
+def _is_position_not_found(exc):
+    """
+    AUTHORITATIVE 'no such position' only (third pass T-03). Alpaca answers a
+    missing position with HTTP 404 and JSON code 40410000 'position does not
+    exist'. Anything else (timeout, 5xx, 429, connection errors, auth errors)
+    is unknown state and must not be read as zero.
+    """
+    if _exc_status_code(exc) == 404:
+        return True
+    if _exc_alpaca_code(exc) == ALPACA_POSITION_NOT_FOUND_CODE:
+        return True
+    return "position does not exist" in str(exc).lower()
+
+
+def broker_position_qty(api, broker_symbol):
+    """
+    Returns (qty, authoritative). authoritative=True with qty 0.0 means the
+    broker positively reported no position; authoritative=False means the
+    broker state is UNKNOWN (transient failure) and callers must fail closed.
+    """
+    try:
+        pos = api.get_position(broker_symbol)
+    except Exception as e:
+        if _is_position_not_found(e):
+            return 0.0, True
+        print(f"[execution] broker position lookup for {broker_symbol} failed (unknown state): {e}")
+        return None, False
+    try:
+        return float(pos.qty), True
+    except Exception as e:
+        print(f"[execution] broker position for {broker_symbol} unreadable: {e}")
+        return None, False
 
 
 def _age_hours(iso_ts):
@@ -141,7 +204,8 @@ def _apply_order_state(strategy, o, border, db_path):
             return "awaiting_fill_price", already, fp
         try:
             portfolio.apply_fill(strategy, o["symbol"], o["side"], delta, fp, db_path=db_path,
-                                 order_update=(o["id"], status, fq, fp))
+                                 order_update=(o["id"], status, fq, fp), broker_order_id=broker_id,
+                                 reason="reconciled broker fill")
         except ValueError as e:
             # A sell fill larger than the ledger: never let one bad order break every
             # future cycle. Record it, mark the order terminal, and continue.
@@ -195,18 +259,14 @@ def has_open_order(api, strategy, symbol, db_path=None):
     return any(o["symbol"] == symbol for o in reconcile_open_orders(api, strategy, db_path=db_path))
 
 
-def _account_position_qty(api, broker_symbol):
-    try:
-        return float(api.get_position(broker_symbol).qty)
-    except Exception:
-        return 0.0
-
-
-def _write_off(strategy, symbol, qty, price, reason, risk_state, owned_qty, account_qty, db_path):
-    portfolio.apply_fill(strategy, symbol, "sell", qty, price, db_path=db_path)
-    log_trade(strategy, symbol, "RECONCILE", price, qty, pnl=None, reason=reason, status="reconciled",
-              strategy_position_before=owned_qty, account_position_before=account_qty,
+def _record_write_off(strategy, symbol, qty, mark, reason, risk_state, owned_qty, account_qty, others, db_path):
+    """Internal reconciliation: ledger write-off + a visible RECONCILE row in `trades`."""
+    credited, realized = portfolio.write_off(strategy, symbol, qty, mark, reason,
+                                             account_qty_observed=account_qty, others_claim=others, db_path=db_path)
+    log_trade(strategy, symbol, "RECONCILE", mark, qty, pnl=realized if realized else None, reason=reason,
+              status="written_off", strategy_position_before=owned_qty, account_position_before=account_qty,
               risk_state=risk_state, db_path=db_path)
+    return credited, realized
 
 
 def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
@@ -241,29 +301,34 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
         return OrderResult(strategy, symbol, side, qty, "refused",
                            message=f"{strategy} already has an open {symbol} order; not submitting another")
 
-    account_qty_before = _account_position_qty(api, broker_symbol)
+    account_qty_before, authoritative = broker_position_qty(api, broker_symbol)
     if side == "sell":
+        if not authoritative:
+            # Fail closed (third pass T-03): unknown broker state is not zero inventory.
+            return OrderResult(strategy, symbol, side, qty, "refused",
+                               message=f"broker position for {symbol} unknown (transient error); not selling this cycle")
         # The account is shared. Honour every OTHER strategy's ledger claim first; this
         # strategy may only sell what is left (second-pass S-03). If nothing is left, the
-        # shares were sold outside this strategy and the ledger is written off.
+        # shares were sold outside this strategy and the ledger is written off (T-01).
         others = portfolio.total_ledger_qty(symbol, exclude_strategy=strategy, db_path=db_path)
         available = max(0.0, account_qty_before - others)
         if available + 1e-9 < qty:
             print(f"[execution] DRIFT {strategy} {symbol}: ledger {owned_qty}, account {account_qty_before}, "
                   f"claimed by others {others}, available {available}")
             missing = owned_qty - available
-            _write_off(strategy, symbol, missing, signal_price or avg_entry,
-                       "ledger quantity missing at broker; written off", risk_state, owned_qty, account_qty_before, db_path)
+            _record_write_off(strategy, symbol, missing, signal_price or avg_entry,
+                              "ledger quantity missing at broker; written off", risk_state,
+                              owned_qty, account_qty_before, others, db_path)
             qty = available
             if qty <= 0:
                 return OrderResult(strategy, symbol, side, missing, "reconciled",
                                    message="position no longer exists at broker; ledger written off")
         if qty * (signal_price or avg_entry) < MIN_SELL_NOTIONAL:
-            # Below the broker minimum: unsellable dust. Write it off rather than
-            # submitting an order that is rejected every cycle (second-pass S-06).
-            _write_off(strategy, symbol, qty, signal_price or avg_entry,
-                       "dust below broker minimum notional; written off", risk_state, owned_qty, account_qty_before, db_path)
-            return OrderResult(strategy, symbol, side, qty, "reconciled", message="dust written off")
+            # Below the broker minimum: unsellable dust. Leave it in the ledger (it is
+            # still real inventory) and do nothing; never credit cash for shares that
+            # were not sold (third pass T-01).
+            return OrderResult(strategy, symbol, side, qty, "dust",
+                               message=f"{qty} {symbol} is below the broker minimum notional; left in place")
 
     client_order_id = f"sq-{strategy}-{uuid.uuid4().hex[:20]}"
     row_id = portfolio.record_order(strategy, symbol, side, qty, signal_price, "submitting", reason=reason,
@@ -302,7 +367,8 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
     booked_qty = 0.0
     if filled_qty > 0 and filled_avg_price:
         realized = portfolio.apply_fill(strategy, symbol, side, filled_qty, filled_avg_price, db_path=db_path,
-                                        order_update=(row_id, status, filled_qty, filled_avg_price))
+                                        order_update=(row_id, status, filled_qty, filled_avg_price),
+                                        broker_order_id=order_id, reason=reason)
         booked_qty = filled_qty
         if side == "buy":
             realized = None

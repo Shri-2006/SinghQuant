@@ -39,11 +39,47 @@ def get_atr_adjusted_thresholds(strategy, current_atr):
     Returns (warning_threshold, kill_threshold) scaled by current market volatility. If ATR is double the baseline, thresholds widen so normal volatility doesn't trip the kill switch. If ATR is below baseline, thresholds tighten to protect capital in calm markets. Scale is kept between 0.5x and 1.5x so it can never go extreme and break everythinng.
     `current_atr` must be a fraction of price (see atr_as_fraction).
     """
-    scale =current_atr /ATR_BASELINE[strategy]
-    scale = max(ATR_SCALE_MIN, min(ATR_SCALE_MAX, scale))  #prevent too far
-    adjusted_warning= WARNING_DRAWDOWN[strategy] *scale
-    adjusted_kill= MAX_DRAWDOWN[strategy]*scale
+    static = (WARNING_DRAWDOWN[strategy], MAX_DRAWDOWN[strategy])
+    baseline = ATR_BASELINE.get(strategy)
+    try:
+        baseline = float(baseline)
+        current_atr = float(current_atr)
+    except (TypeError, ValueError):
+        return static
+    # Third pass T-04: a zero/negative/NaN baseline or ATR must fall back to the
+    # static thresholds. Note min(1.5, nan) silently returns 1.5 in Python, so
+    # NaN would otherwise WIDEN the thresholds to the maximum.
+    if not (math.isfinite(baseline) and baseline > 0 and math.isfinite(current_atr) and current_atr >= 0):
+        return static
+    scale = current_atr / baseline
+    scale = max(ATR_SCALE_MIN, min(ATR_SCALE_MAX, scale))  # never beyond [0.5x, 1.5x]
+    adjusted_warning = WARNING_DRAWDOWN[strategy] * scale
+    adjusted_kill = MAX_DRAWDOWN[strategy] * scale
     return (adjusted_warning, adjusted_kill)
+
+
+def portfolio_atr_fraction(position_values, atr_fractions):
+    """
+    Strategy-level volatility for the kill switch: the position-value-weighted
+    mean of the held symbols' ATR fractions (third pass T-02). Returns None
+    when nothing is held or no held symbol has a usable ATR, so the caller
+    falls back to the static thresholds.
+    position_values: {symbol: value_in_dollars}; atr_fractions: {symbol: fraction or None}.
+    """
+    num = 0.0
+    den = 0.0
+    for symbol, value in position_values.items():
+        frac = atr_fractions.get(symbol)
+        try:
+            value = float(value)
+            frac = None if frac is None else float(frac)
+        except (TypeError, ValueError):
+            continue
+        if frac is None or not math.isfinite(frac) or frac < 0 or not math.isfinite(value) or value <= 0:
+            continue
+        num += value * frac
+        den += value
+    return (num / den) if den > 0 else None
 
 
 def risk_level_from_drawdown(strategy, drawdown, current_atr=None):

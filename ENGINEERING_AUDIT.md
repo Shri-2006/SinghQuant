@@ -22,7 +22,7 @@ SinghQuant is a three-strategy paper-trading system (XGBoost "stable", XGBoost "
 
 The deployed instance was still running the old code during the audit: the export's last rows are a risky1 TSLA BUY at 16:47:34 UTC and SELL at 16:49:55 UTC on the audit day.
 
-All of the above is fixed in this working copy, covered by 124 tests (68 original, 41 first-pass and 15 second-pass regression tests against a fake broker; 123 run in CI, one network-dependent test deselected), and documented below. A second, adversarial pass over the first-pass fixes found nine further defects in the new code (section 11), all fixed and tested. What could not be fixed from a ZIP (training models, the missing live database, the Alpaca-side cause of the July 7 reading) is stated in sections 9 and 11.5. **The system is not declared deployment-ready**: nothing has been exercised against the real broker.
+All of the above is fixed in this working copy, covered by 151 collected tests (68 original, 41 first-pass, 15 second-pass and 27 third-pass regression cases against a fake broker; 150 run in CI, one network-dependent test deselected), and documented below. A second, adversarial pass over the first-pass fixes found nine further defects in the new code (section 11), and a third pass driven by independent reviewers confirmed seven of eight further concerns, including a write-off that booked itself as a broker sale and a position lookup that read transient broker failures as "no position" (section 12); all fixed and tested. What could not be fixed from a ZIP (training models, the missing live database, the Alpaca-side cause of the July 7 reading) is stated in sections 9 and 11.5. **The system is not declared deployment-ready**: nothing has been exercised against the real broker.
 
 ---
 
@@ -675,6 +675,74 @@ python -m pytest tests/ -q --deselect tests/test_regime.py::TestVIXSignal::test_
 - Realized P&L booked on a `RECONCILE` write-off uses the signal price, which is an estimate.
 - The ledger starts every strategy at `CAPITAL` on migration; historical realized P&L stays in the `trades` table and is not carried into the new cash budget. This is a documented accounting reset, not a loss of data.
 - Orders queued while the market is closed (DAY market orders submitted after 16:00 ET) are handled as pending and reconciled, but this path is untested against the real broker.
+
+## 12. Third-pass review (independent reviewer concerns, traced before acting)
+
+Scope: eight concerns raised by a second independent reviewer (two of them also raised by a first reviewer), each traced against the actual code, callers, persistence and tests before any change. Suggested fixes were not adopted as given; the design chosen for each is recorded with its reason.
+
+### 12.1 Findings
+
+| Id | Concern | Verdict | Severity | Root cause (when confirmed) |
+|---|---|---|---|---|
+| T-01 | `_write_off` books internal reconciliation as a broker sale | **CONFIRMED** | HIGH | `_write_off` called `portfolio.apply_fill(..., "sell", price)`, which credits virtual cash at the signal price and books realized P&L exactly like a fill; for dust the shares were not even sold (they stayed at the broker while the ledger was credited) |
+| T-02 | ATR-adjusted kill thresholds are dead code in the live path | **CONFIRMED** | HIGH | `evaluate_risk` called `risk_level_from_drawdown(..., None)`; only per-ticker sizing used ATR. The original code had the same gap (its kill switch passed no ATR either) while the decision log, config comments, WEEK7 plan and README all describe an ATR-adjusted kill switch |
+| T-03 | Position lookup treats any exception as zero shares | **CONFIRMED** | HIGH | `_account_position_qty` returned 0.0 on every exception; in the sell path that made `available = 0` and wrote off the entire position on a timeout, 5xx or 429 |
+| T-04 | Zero/missing/NaN ATR baseline misbehaves | **CONFIRMED** | MEDIUM | Division by a zero baseline raised; `min(1.5, nan)` returns 1.5 in Python, so a NaN input silently widened thresholds to the maximum |
+| T-05 | Reconciliation mutations lack durable provenance | **CONFIRMED (design gap)** | MEDIUM | Only a `trades` row with action `RECONCILE` existed; no record of the observed broker quantity, other strategies' claims, cost basis or valuation basis, and fills/adoptions left no journal at all |
+| T-06 | Two repeated abnormal readings "confirm" a bad value | **CONFIRMED** | HIGH | The second-pass rule accepted a suspect equity when the next reading agreed within 5%; with static daily bars a corrupt bar is identical every cycle, so it confirmed itself on cycle two and could kill on cycle three. Input validation and state confirmation were conflated |
+| T-07 | Engine trusts strategies for the anti-churn invariant | **DESIGN RISK, one demonstrated case** | MEDIUM | `exit_condition_active` is computed by the engine (not reported by strategies), so the momentum path is sound. The PPO decider observes its own position and can legitimately answer BUY when flat and SELL when long on the same static bar; with `ONE_ACTION_PER_BAR["risky2"] = False` this was a 30-minute-period oscillator (2,700 round trips in the export) |
+| T-08 | Dependencies cannot be installed on a CPU-only node | **CONFIRMED (operational)** | MEDIUM | `torch==2.11.0`/`torch>=2.2` from PyPI pulls the CUDA build plus nvidia-* packages on Linux; RL, backtest, dashboard and Gemini packages were not separable from the core runtime; `data/macro_fetcher.py` imported `google.genai` at module load |
+
+### 12.2 Fixes
+
+**T-01 / T-05 (accounting and auditability).** `core/portfolio.py` gained a distinct `write_off()` operation and a `ledger_events` journal (new table, additive migration). `apply_fill` is now broker-fills-only and journals `FILL` rows carrying the broker order id; `adopt_position` journals `ADOPT`; `write_off` journals `WRITE_OFF_DRIFT` with no broker order id, the observed broker quantity, other strategies' claims, cost basis and valuation basis. A write-off credits cash at `min(mark, average entry)`, so an internal event can never increase equity or create positive realized P&L: unrealized gains on vanished shares are forfeited, unrealized losses are realized. Dust below the broker's $1 minimum is no longer written off at all: it stays owned, sells return status `dust` with no mutation, and the halted follow-up liquidation tolerates it. The reviewer's suggestion of an `orders` row with `status="written_off"` was rejected: `orders` holds broker semantics only; internal accounting lives in `ledger_events` (the `trades` table keeps a visible `RECONCILE` row for the dashboard, marked `written_off`).
+
+**T-02 (ATR wiring).** Intent was established from four independent documents as "ATR-adjusted". A strategy-level volatility measure was needed because the kill switch is a portfolio decision and ATR is per ticker: `portfolio_atr_fraction` (position-value-weighted mean of held symbols' ATR fractions, `None` when nothing is held or no ATR is usable) now feeds `risk_level_from_drawdown` in `evaluate_risk`. The clamp keeps every threshold inside 0.5x to 1.5x of the configured value (stable kill between -7.5% and -22.5%, risky1 between -15% and -45%), and per-ticker sizing can no longer override a strategy-level warning (`max_pos` is halved whenever the strategy level is warning). Documented consequence: in volatile regimes the kill switch is looser than the static -15% by design, never beyond 1.5x.
+
+**T-03 (fail closed).** `broker_position_qty(api, symbol)` returns `(qty, authoritative)`. Only HTTP 404, Alpaca code 40410000 or the message "position does not exist" count as an authoritative zero; timeouts, 5xx, 429, connection errors, unreadable responses and `APIError` objects without an HTTP response are `(None, False)`. Sells and write-offs are refused for the cycle when the state is unknown; the position keeps being managed and the stop is retried once the broker answers.
+
+**T-04.** `get_atr_adjusted_thresholds` returns the static thresholds for a missing, zero, negative, NaN or infinite baseline or ATR.
+
+**T-06 (validation versus confirmation).** The consecutive-agreement rule is gone. Input validation is now per mark: a mark that moved more than `MARK_MAX_STEP_CHANGE` (50%) from the last accepted mark, or that comes from a bar older than `STALE_BAR_MAX_DAYS` (5), is checked against the broker's own position quote; agreement accepts it, disagreement substitutes the quote, no quote makes the symbol suspect (valued at its last accepted mark; no stop, no signal, no entry on it that cycle). In addition, a critical state is only counted when the broker corroborates every held mark, so a bad print inside the step limit cannot confirm itself; an unavailable quote makes the reading suspect. State confirmation (`KILL_SWITCH_CONFIRMATIONS = 2`) is unchanged, so a genuine corroborated crash still kills on the second cycle. Accepted marks are persisted per position (`positions.last_mark`) and used by the stop loss and the emergency liquidation instead of the raw bar.
+
+**T-07.** `ONE_ACTION_PER_BAR["risky2"] = True`. This is the training semantics of the PPO environment (one step per bar) and closes the demonstrated oscillation; no strategy signal or threshold was changed.
+
+**T-08.** Requirements split into `requirements-core.txt` (paper-trading runtime, CPU only), `requirements-dev.txt`, `requirements-rl.txt` (torch from the CPU wheel index, SB3, gymnasium), `requirements-backtest.txt`, `requirements-dashboard.txt`, `requirements-optional.txt`; `requirements.txt` includes all of them; the pinned file gained the CPU extra index and `setup.sh --pinned --with-rl` installs torch from it first. `setup.sh` takes `--with-rl/--with-backtest/--with-dashboard/--with-optional/--all`. `google.genai` is imported lazily. The core runtime is verified to import and pass `run.preflight()` with torch, Stable-Baselines3, gymnasium, vectorbt, Streamlit, Plotly and google-genai blocked.
+
+### 12.3 Regression tests (tests/test_third_pass.py: 22 test functions, 27 collected cases)
+
+| Id | Tests |
+|---|---|
+| T-01 | `test_t01_drift_write_off_never_increases_equity_or_books_a_gain`, `test_t01_drift_write_off_at_a_loss_realizes_the_loss_not_a_gain`, `test_t01_dust_is_left_in_place_and_credits_nothing`, `test_t01_apply_fill_is_not_used_for_internal_write_offs` |
+| T-02 | `test_t02_live_kill_switch_path_uses_atr_adjusted_thresholds_within_bounds`, `test_t02_missing_or_unheld_atr_falls_back_to_static`, `test_t02_run_cycle_passes_atr_into_the_decision` (end to end through `run_cycle`), `test_t02_strategy_level_warning_halves_size_even_if_ticker_atr_is_wide` |
+| T-03 | `test_t03_broker_position_lookup_classification` (6 parametrised cases: genuine missing, timeout, 500, 429, transport, generic), `test_t03_alpaca_style_error_objects_are_classified_correctly` (APIError-shaped objects with `code`/`status_code` properties, including `status_code = None`), `test_t03_successful_lookup_and_transient_failure_do_not_write_off`, `test_t03_engine_keeps_managing_a_position_through_a_broker_outage` |
+| T-04 | `test_t04_bad_baseline_or_atr_falls_back_to_static_thresholds` |
+| T-05 | `test_t05_every_inventory_change_is_journaled_with_provenance` (cash budget equals CAPITAL plus the sum of journaled cash deltas) |
+| T-06 | `test_t06_one_extreme_bad_bar_is_overridden_by_the_broker_quote`, `test_t06_two_identical_bad_bars_do_not_confirm_each_other`, `test_t06_repeated_stale_bar_uses_the_broker_quote`, `test_t06_genuine_rapid_crash_still_kills_quickly`, `test_t06_recovery_after_a_bad_reading`, `test_t06_suspect_symbol_blocks_stop_loss_on_the_bad_price` |
+| T-07 | `test_t07_position_dependent_decider_cannot_oscillate_within_a_bar` |
+| T-08 | `test_t08_core_runtime_imports_without_optional_packages` (subprocess with the optional modules blocked) |
+
+Tests whose behaviour changed because the semantics changed (updated, not deleted): `test_s06_dust_remainder_is_written_off_not_resubmitted` renamed to `..._is_not_resubmitted_every_cycle` (dust now stays owned); `test_implausible_equity_jump_is_suspect_and_does_not_kill` (a repeated identical bad reading now stays suspect; a corroborated one becomes critical); `test_kill_switch_needs_two_confirmations_then_closes_only_own_positions` and `test_s09_halted_strategy_keeps_trying_to_flatten_leftover_positions` (direct `evaluate_risk` calls now pass a corroborating quote for their 80% move).
+
+Two third-pass tests failed on first run because of their own construction: in both, the 5% stop loss legitimately closed the position on the validated price in cycle one, before the assertion about cycle two. They were rebuilt (a 4% price move on an over-sized adopted position for the threshold test; explicit cycle-one/cycle-two assertions for the stale-bar test). No product change resulted.
+
+### 12.4 Validation
+
+```
+python -m pytest tests/ -q --deselect tests/test_regime.py::TestVIXSignal::test_get_vix_returns_float_or_none
+150 passed, 1 deselected, 0 failed, 0 skipped, 0 warnings   (151 collected: 68 original, 41 first pass, 15 second pass, 27 third pass including 6 parametrised cases)
+pip --dry-run: requirements-core.txt + requirements-dev.txt and requirements-rl.txt both resolve
+```
+
+### 12.5 Remaining uncertainty
+
+- Everything above is validated against `FakeAlpaca`. The real `alpaca-trade-api` behaviour for `get_order_by_client_order_id`, the exact exception shape of a missing position, crypto symbol spelling in `list_positions`, and `current_price` freshness on a paper account have not been observed with this code.
+- The broker cross-check uses the position record's `current_price`, which exists only for symbols the account holds. A ledger position that the account no longer holds cannot be corroborated; such a symbol is written off on its next exit attempt through the authoritative-404 path, which is the intended outcome.
+- A corrupt bar within the 50% step limit that the broker quote also happens to agree with cannot be detected; two independent sources agreeing is the accepted limit of this design.
+- The CPU-only Linux install has not been executed on the Acer or HP nodes; only pip resolution and the optional-package-absent import test were run here (Windows, Python 3.14).
+- Write-off valuation at `min(mark, cost)` is conservative by construction; the strategy's virtual budget may understate what the shared account actually received for shares sold outside the system. This is documented, journaled, and biased toward halting rather than trading.
+
+**Readiness statement.** The branch is ready for the next stage, controlled Linux integration testing against `FakeAlpaca` and then Alpaca paper, with the specific items above as the checklist for that stage. It is not ready for unattended paper trading and is not evaluated for live trading.
 
 ## Appendix A: analysis scripts used on the export
 

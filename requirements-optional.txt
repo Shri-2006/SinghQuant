@@ -1,0 +1,2 @@
+# OPTIONAL: Google Gemini fallback for the macro classifier (imported lazily).
+google-genai>=1.0

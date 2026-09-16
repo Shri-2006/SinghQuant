@@ -1,51 +1,20 @@
-# SinghQuant runtime dependencies.
+# SinghQuant: FULL install (every optional component). For a CPU-only
+# paper-trading node use `bash setup.sh` (core + dev) and add flags for what
+# you need; see setup.sh.
 #
-# Two files exist:
-#   requirements.txt              (this file) compatible ranges, verified on
-#                                 Python 3.14 during the 2026-09 audit
-#   requirements-py311-pinned.txt the original exact pins used on the Oracle
-#                                 ARM deployment and in the Dockerfile (3.11)
+#   requirements-core.txt        paper-trading runtime (stable, risky1, ledger, execution)
+#   requirements-dev.txt         pytest
+#   requirements-rl.txt          risky2 PPO (torch from the CPU wheel index)
+#   requirements-backtest.txt    vectorbt
+#   requirements-dashboard.txt   streamlit
+#   requirements-optional.txt    google-genai macro fallback
+#   requirements-py311-pinned.txt original exact pins of the last deployment (Python 3.11)
 #
-# Install with `bash setup.sh` (or `python -m pip install -r requirements.txt`
-# followed by the alpaca step below). alpaca-trade-api 3.0.0 is unmaintained
-# and pins websockets<11 / aiohttp==3.8.2, which do not build on Python 3.12+;
-# it must be installed with --no-deps and its transitive deps supplied loosely.
-
-# Data sources
-polygon-api-client>=1.14,<2
-textblob>=0.18
-pandas>=2.2
-numpy>=1.26
-ta>=0.11
-feedparser>=6.0
-requests>=2.31
-
-# ML
-scikit-learn>=1.4
-xgboost>=2.0
-stable-baselines3>=2.3
-gymnasium>=0.29
-torch>=2.2
-
-# Backtesting (vectorbt 0.28-1.1 imports fail with plotly>=7)
-vectorbt>=0.26
-plotly>=5.18,<7
-
-# Dashboard
-streamlit>=1.35
-
-# Scheduling
-APScheduler>=3.10,<4
-
-# Environment
-python-dotenv>=1.0
-
-# Testing
-pytest>=8.0
-
-# Google AI (macro classifier fallback)
-google-genai>=1.0
-
-# Alpaca trading: install separately, see setup.sh
-# alpaca-trade-api==3.0.0   --no-deps
-# msgpack websocket-client PyYAML deprecation aiohttp websockets
+# alpaca-trade-api 3.0.0 is unmaintained and pins websockets<11 / aiohttp==3.8.2,
+# which do not build on Python 3.12+; setup.sh installs it with --no-deps.
+-r requirements-core.txt
+-r requirements-dev.txt
+-r requirements-dashboard.txt
+-r requirements-backtest.txt
+-r requirements-optional.txt
+-r requirements-rl.txt

@@ -52,7 +52,8 @@ Key design points established by the audit:
 
 - **Strategy ownership.** Alpaca positions are account-wide, so the system keeps its own per-strategy ledger in SQLite. A strategy can only sell what its ledger says it owns; a kill switch closes only that strategy's positions; drawdown is measured on the strategy's own equity (cash budget + owned positions), not the shared account number.
 - **Units.** Order quantities are shares/coins everywhere. Dollar budgets are converted exactly once, at sizing. Every `trades` row logs the signal price, the requested quantity, the broker order id, the status, and the actual fill quantity and price.
-- **Kill switch.** Fires only after two consecutive critical readings, and implausible equity jumps (more than 50% in one cycle, NaN, zero) are treated as suspect rather than acted on. A halted strategy stays halted across restarts until `python tools/reset_kill_switch.py <strategy>` is run.
+- **Kill switch.** Thresholds are the configured drawdowns scaled by the strategy's position-weighted ATR fraction, clamped to 0.5x to 1.5x, and static when no ATR is available. It fires only after two consecutive critical readings of a *validated* equity: a mark that moved more than 50% from the last accepted mark, or that comes from a bar older than five days, is checked against the broker's own quote; if they disagree the broker quote is used, and if no independent quote exists the symbol is marked suspect and nothing is done on it that cycle. Two identical bad bars therefore never confirm each other. A halted strategy stays halted across restarts until `python tools/reset_kill_switch.py <strategy>` is run.
+- **Reconciliation is never a fill.** Inventory missing at the broker is written off through a distinct ledger event (`ledger_events.WRITE_OFF_DRIFT`) that credits cash at the lower of mark and cost, so an internal event can never raise equity or book a gain. Unsellable dust stays owned. An unknown broker state (timeout, 5xx, rate limit) is never read as "no position".
 - **Signal price vs fill price.** On Polygon's free tier the latest daily bar is the previous close; that is the *signal* price and is logged as such. Fill prices come from Alpaca and are logged separately.
 
 ## Tech stack
@@ -88,10 +89,14 @@ cd SinghQuant
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
-bash setup.sh            # compatible ranges (requirements.txt)
-bash setup.sh --pinned   # original exact pins, Python 3.11 only
+bash setup.sh                    # CPU-only core paper-trading runtime + pytest (stable, risky1, ledger, execution)
+bash setup.sh --with-rl          # add risky2 PPO (torch from the CPU wheel index, no CUDA download)
+bash setup.sh --with-dashboard   # add Streamlit
+bash setup.sh --with-backtest    # add vectorbt
+bash setup.sh --all              # everything
+bash setup.sh --pinned --with-rl # original exact pins, Python 3.11 only (what the Dockerfile uses)
 ```
-`setup.sh` installs `alpaca-trade-api` with `--no-deps` because its declared pins (`websockets<11`, `aiohttp==3.8.2`) conflict with `polygon-api-client` and do not build on Python 3.12+. On Windows without bash, run the four `pip install` lines from `setup.sh` by hand.
+The dependency set is split so a CPU-only Linux staging node needs only `requirements-core.txt` plus pytest; the core runtime is verified to import and start with torch, Stable-Baselines3, gymnasium, vectorbt, Streamlit, Plotly and google-genai absent. `setup.sh` installs `alpaca-trade-api` with `--no-deps` because its declared pins (`websockets<11`, `aiohttp==3.8.2`) conflict with `polygon-api-client` and do not build on Python 3.12+. On Windows without bash, run the `pip install` lines from `setup.sh` by hand.
 
 **3. Create `.env`** (never committed; values omitted on purpose)
 ```

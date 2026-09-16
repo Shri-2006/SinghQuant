@@ -12,17 +12,28 @@ ACCOUNT's positions and equity, so:
   * "drawdown" was account equity versus one strategy's notional capital.
 
 This module keeps, per strategy, in SQLite:
-  * positions      : qty and average entry price per symbol that THIS strategy owns
+  * positions      : qty, average entry and last accepted mark per symbol that THIS strategy owns
   * strategy_state : the strategy's own cash budget, peak equity, kill-switch state
   * signal_state   : last bar/action per symbol (anti-churn state machine)
+  * orders         : BROKER orders this strategy submitted (broker semantics only)
+  * ledger_events  : the journal of EVERY inventory/cash mutation and why
+                     (FILL = broker fill, ADOPT = migration, WRITE_OFF_DRIFT =
+                     internal reconciliation). Third pass T-01/T-05: internal
+                     accounting events are never represented as broker orders
+                     or fills, and can never increase equity.
 
 Strategy equity = cash_budget + sum(qty * mark_price). All quantities are in
 shares (or coins). Dollars never enter the `qty` fields.
 """
+import math
 from datetime import datetime, timezone
 
 from core.config import CAPITAL
 from core.logger import db_connection, utc_now_iso
+
+EVENT_FILL = "FILL"
+EVENT_ADOPT = "ADOPT"
+EVENT_WRITE_OFF_DRIFT = "WRITE_OFF_DRIFT"
 
 
 def _now():
@@ -101,6 +112,25 @@ def list_positions(strategy, db_path=None):
     return {r[0]: (float(r[1]), float(r[2]), r[3]) for r in rows}
 
 
+def get_last_marks(strategy, db_path=None):
+    """{symbol: last accepted mark price} for this strategy's positions (None if never marked)."""
+    with db_connection(db_path) as conn:
+        rows = conn.execute('SELECT symbol, last_mark FROM positions WHERE strategy = ? AND qty > 0', (strategy,)).fetchall()
+    return {r[0]: (float(r[1]) if r[1] is not None else None) for r in rows}
+
+
+def set_last_marks(strategy, marks, db_path=None):
+    """Records the marks that were accepted for valuation this cycle."""
+    if not marks:
+        return
+    now = utc_now_iso()
+    with db_connection(db_path) as conn:
+        for symbol, px in marks.items():
+            if px is not None and px > 0:
+                conn.execute('UPDATE positions SET last_mark = ?, last_mark_at = ? WHERE strategy = ? AND symbol = ?',
+                             (float(px), now, strategy, symbol))
+
+
 def total_ledger_qty(symbol, exclude_strategy=None, db_path=None):
     """
     Total quantity of `symbol` claimed by every strategy's ledger (optionally
@@ -116,13 +146,27 @@ def total_ledger_qty(symbol, exclude_strategy=None, db_path=None):
     return float(row[0] or 0.0)
 
 
-def apply_fill(strategy, symbol, side, filled_qty, fill_price, db_path=None, order_update=None):
+def _insert_event(conn, strategy, symbol, event_type, qty_delta, cash_delta, price, avg_entry_before,
+                  qty_before, qty_after, reason, broker_order_id=None, extra=None):
+    conn.execute('''INSERT INTO ledger_events (timestamp, strategy, symbol, event_type, qty_delta, cash_delta, price,
+                                               avg_entry_before, qty_before, qty_after, reason, broker_order_id, extra)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                 (utc_now_iso(), strategy, symbol, event_type, float(qty_delta), float(cash_delta),
+                  None if price is None else float(price), float(avg_entry_before), float(qty_before),
+                  float(qty_after), reason, broker_order_id, extra))
+
+
+def apply_fill(strategy, symbol, side, filled_qty, fill_price, db_path=None, order_update=None,
+               broker_order_id=None, reason=None):
     """
-    Applies a broker fill to the strategy ledger and its cash budget.
+    Applies a BROKER fill to the strategy ledger and its cash budget.
     side: "buy" | "sell". filled_qty is a share/coin quantity (never dollars).
     Returns realized pnl in dollars for sells (0.0 for buys).
     Raises ValueError if a sell exceeds the owned quantity: the ledger never
     goes negative, because this system does not short.
+
+    This function is for broker fills ONLY. Internal reconciliation must use
+    write_off(), which cannot credit proceeds above mark or cost (third pass T-01).
 
     order_update: optional (order_row_id, status, total_filled_qty, filled_avg_price)
     written in the SAME transaction, so a crash can never leave a fill applied
@@ -148,26 +192,33 @@ def apply_fill(strategy, symbol, side, filled_qty, fill_price, db_path=None, ord
         if side == "buy":
             new_qty = qty + filled_qty
             new_avg = (qty * avg + filled_qty * fill_price) / new_qty
-            cash -= filled_qty * fill_price
+            cash_delta = -filled_qty * fill_price
+            cash += cash_delta
             if row is None:
                 conn.execute('INSERT INTO positions (strategy, symbol, qty, avg_entry_price, opened_at, updated_at) VALUES (?,?,?,?,?,?)',
                              (strategy, symbol, new_qty, new_avg, now, now))
             else:
                 conn.execute('UPDATE positions SET qty = ?, avg_entry_price = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
                              (new_qty, new_avg, now, strategy, symbol))
+            _insert_event(conn, strategy, symbol, EVENT_FILL, +filled_qty, cash_delta, fill_price, avg, qty, new_qty,
+                          reason or "broker buy fill", broker_order_id)
         elif side == "sell":
             # Tolerate float noise from broker rounding, never a real oversell.
             if filled_qty > qty * (1 + 1e-6) + 1e-9:
                 raise ValueError(f"{strategy} cannot sell {filled_qty} {symbol}: owns only {qty}")
             filled_qty = min(filled_qty, qty)
             realized = filled_qty * (fill_price - avg)
-            cash += filled_qty * fill_price
+            cash_delta = filled_qty * fill_price
+            cash += cash_delta
             new_qty = qty - filled_qty
             if new_qty <= 1e-9:
+                new_qty = 0.0
                 conn.execute('DELETE FROM positions WHERE strategy = ? AND symbol = ?', (strategy, symbol))
             else:
                 conn.execute('UPDATE positions SET qty = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
                              (new_qty, now, strategy, symbol))
+            _insert_event(conn, strategy, symbol, EVENT_FILL, -filled_qty, cash_delta, fill_price, avg, qty, new_qty,
+                          reason or "broker sell fill", broker_order_id, extra=f"realized={realized:.6f}")
         else:
             raise ValueError(f"unknown side {side!r}")
 
@@ -180,9 +231,100 @@ def adopt_position(strategy, symbol, qty, avg_entry_price, db_path=None):
     """
     Records a position that already exists at the broker as owned by a
     strategy (used once when migrating an old database). Debits the cash
-    budget at the entry price so equity stays consistent.
+    budget at the entry price so equity stays consistent. Journaled as ADOPT.
     """
-    apply_fill(strategy, symbol, "buy", qty, avg_entry_price, db_path)
+    qty = float(qty)
+    avg_entry_price = float(avg_entry_price)
+    if qty <= 0 or avg_entry_price <= 0:
+        return
+    ensure_strategy_state(strategy, db_path)
+    now = utc_now_iso()
+    with db_connection(db_path) as conn:
+        row = conn.execute('SELECT qty, avg_entry_price FROM positions WHERE strategy = ? AND symbol = ?',
+                           (strategy, symbol)).fetchone()
+        old_qty, old_avg = (float(row[0]), float(row[1])) if row else (0.0, 0.0)
+        new_qty = old_qty + qty
+        new_avg = (old_qty * old_avg + qty * avg_entry_price) / new_qty
+        cash = conn.execute('SELECT cash_budget FROM strategy_state WHERE strategy = ?', (strategy,)).fetchone()[0]
+        cash_delta = -qty * avg_entry_price
+        if row is None:
+            conn.execute('INSERT INTO positions (strategy, symbol, qty, avg_entry_price, opened_at, updated_at) VALUES (?,?,?,?,?,?)',
+                         (strategy, symbol, new_qty, new_avg, now, now))
+        else:
+            conn.execute('UPDATE positions SET qty = ?, avg_entry_price = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
+                         (new_qty, new_avg, now, strategy, symbol))
+        conn.execute('UPDATE strategy_state SET cash_budget = ?, updated_at = ? WHERE strategy = ?',
+                     (cash + cash_delta, now, strategy))
+        _insert_event(conn, strategy, symbol, EVENT_ADOPT, +qty, cash_delta, avg_entry_price, old_avg, old_qty, new_qty,
+                      "adopted pre-existing broker position into the ledger")
+
+
+def write_off(strategy, symbol, qty, mark_price, reason, account_qty_observed=None, others_claim=None, db_path=None):
+    """
+    INTERNAL reconciliation: removes `qty` of `symbol` from the strategy's
+    ledger because the shares are no longer at the broker under this
+    strategy's claim (sold outside the system, legacy close_all, manual trade).
+
+    No broker fill occurred, so this must never masquerade as one:
+      * cash is credited at min(mark, average entry): equity can never INCREASE
+        and no positive realized P&L can ever be created by an internal event
+        (third pass T-01). Any unrealized gain on the written-off shares is
+        forfeited; any unrealized loss is realized.
+      * the mutation is journaled in ledger_events as WRITE_OFF_DRIFT with the
+        observed broker quantity and other strategies' claims (T-05), with no
+        broker_order_id, so it can never be mistaken for a fill.
+    Returns (cash_credited, realized_estimate).
+    """
+    qty = float(qty)
+    if qty <= 0:
+        return 0.0, 0.0
+    ensure_strategy_state(strategy, db_path)
+    now = utc_now_iso()
+    with db_connection(db_path) as conn:
+        row = conn.execute('SELECT qty, avg_entry_price FROM positions WHERE strategy = ? AND symbol = ?',
+                           (strategy, symbol)).fetchone()
+        if row is None:
+            return 0.0, 0.0
+        owned, avg = float(row[0]), float(row[1])
+        qty = min(qty, owned)
+        try:
+            mark = float(mark_price)
+        except (TypeError, ValueError):
+            mark = float("nan")
+        basis = avg if not (math.isfinite(mark) and mark > 0) else min(mark, avg)
+        cash_delta = qty * basis
+        realized = qty * (basis - avg)           # <= 0 by construction
+        new_qty = owned - qty
+        cash = conn.execute('SELECT cash_budget FROM strategy_state WHERE strategy = ?', (strategy,)).fetchone()[0]
+        if new_qty <= 1e-9:
+            new_qty = 0.0
+            conn.execute('DELETE FROM positions WHERE strategy = ? AND symbol = ?', (strategy, symbol))
+        else:
+            conn.execute('UPDATE positions SET qty = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
+                         (new_qty, now, strategy, symbol))
+        conn.execute('UPDATE strategy_state SET cash_budget = ?, updated_at = ? WHERE strategy = ?',
+                     (cash + cash_delta, now, strategy))
+        _insert_event(conn, strategy, symbol, EVENT_WRITE_OFF_DRIFT, -qty, cash_delta, basis, avg, owned, new_qty,
+                      reason, None,
+                      extra=f"mark={mark_price} account_qty={account_qty_observed} others_claim={others_claim} realized_estimate={realized:.6f}")
+    return cash_delta, realized
+
+
+def list_ledger_events(strategy=None, symbol=None, event_type=None, db_path=None):
+    """Journal rows (dicts) in insertion order, optionally filtered."""
+    clauses, params = [], []
+    if strategy:
+        clauses.append("strategy = ?"); params.append(strategy)
+    if symbol:
+        clauses.append("symbol = ?"); params.append(symbol)
+    if event_type:
+        clauses.append("event_type = ?"); params.append(event_type)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    cols = ["id", "timestamp", "strategy", "symbol", "event_type", "qty_delta", "cash_delta", "price",
+            "avg_entry_before", "qty_before", "qty_after", "reason", "broker_order_id", "extra"]
+    with db_connection(db_path) as conn:
+        rows = conn.execute(f'SELECT {", ".join(cols)} FROM ledger_events {where} ORDER BY id', params).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -193,19 +335,20 @@ def strategy_equity(strategy, mark_prices, db_path=None):
     """
     Strategy equity = own cash budget + own positions at `mark_prices`.
     mark_prices: {symbol: price}. Symbols without a mark are valued at their
-    average entry price (conservative when data is missing rather than 0,
+    last accepted mark, or at average entry if never marked (never at zero,
     which would fake a drawdown; see audit issue C-03).
     Returns (equity, positions_value, missing_marks).
     """
     state = get_strategy_state(strategy, db_path)
     positions = list_positions(strategy, db_path)
+    last_marks = get_last_marks(strategy, db_path)
     value = 0.0
     missing = []
     for symbol, (qty, avg, _) in positions.items():
         px = mark_prices.get(symbol)
         if px is None or not (px > 0):
             missing.append(symbol)
-            px = avg
+            px = last_marks.get(symbol) or avg
         value += qty * px
     return state["cash_budget"] + value, value, missing
 
@@ -235,7 +378,7 @@ def set_signal_state(strategy, symbol, last_bar, last_action, db_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Orders
+# Orders (BROKER orders only; internal accounting never appears here)
 # ---------------------------------------------------------------------------
 
 # "submitting" is included: an order row in that state means the process may

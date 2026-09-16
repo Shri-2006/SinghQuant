@@ -1,7 +1,8 @@
 import os
 import requests
 #import google.generativeai as genai #DEPRECATED
-from google import genai
+# google-genai is an optional dependency (macro classifier fallback); imported
+# lazily so the core paper-trading runtime does not require it (third pass T-08).
 
 from dotenv import load_dotenv
 
@@ -163,6 +164,7 @@ def _gemini_is_configured():
 
 def _classify_with_gemini(text):
     try:
+        from google import genai
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
             "Classify the macro market risk based on this financial news text. "

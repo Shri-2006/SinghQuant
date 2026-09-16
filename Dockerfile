@@ -3,10 +3,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt requirements-py311-pinned.txt setup.sh ./
+COPY requirements*.txt setup.sh ./
 # Pinned versions reproduce the original deployment; alpaca is installed
 # without its stale dependency pins (see setup.sh for why).
-RUN bash setup.sh --pinned
+RUN bash setup.sh --pinned --with-rl
 COPY . .
 # copy all project files to all
 ENV PYTHONUNBUFFERED=1

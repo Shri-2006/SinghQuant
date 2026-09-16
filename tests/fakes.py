@@ -39,6 +39,7 @@ class FakeAlpaca:
         self.account_overrides = {}
         self.get_order_calls = 0
         self.fail_get_order = None   # exception to raise from get_order, if set
+        self.fail_get_position = None  # exception to raise from get_position, if set
 
     # --- helpers for tests -------------------------------------------------
     def set_price(self, symbol, price):
@@ -77,6 +78,8 @@ class FakeAlpaca:
                                next_open=now + timedelta(hours=15), next_close=now + timedelta(hours=6))
 
     def get_position(self, symbol):
+        if self.fail_get_position is not None:
+            raise self.fail_get_position
         p = self.positions.get(symbol)
         if not p or p["qty"] == 0:
             raise FakeAPIError(f"position does not exist: {symbol}", 404)

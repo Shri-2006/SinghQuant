@@ -1,0 +1,4 @@
+# OPTIONAL: vectorbt backtesting (backtesting/ and tests/test_backtesting.py).
+# vectorbt 0.28-1.1 fails to import with plotly>=7 (removed scattermapbox).
+vectorbt>=0.26
+plotly>=5.18,<7

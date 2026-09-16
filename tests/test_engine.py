@@ -189,10 +189,11 @@ def test_kill_switch_needs_two_confirmations_then_closes_only_own_positions(db_p
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
     submit_and_track(api, "risky1", "NVDA", "buy", 0.5, 100.0, "x", db_path=db_path, **FAST)
     ctx = make_ctx("stable", api, {"SPY": None}, db_path=db_path)
-    # SPY falls 80%: stable equity 1000 -> 840 (-16%), beyond the -15% switch
-    r1 = evaluate_risk(ctx, {"SPY": 100.0})
+    # SPY falls 80%: stable equity 1000 -> 840 (-16%), beyond the -15% switch.
+    # An 80% move needs an independent quote (third pass T-06); the broker agrees here.
+    r1 = evaluate_risk(ctx, {"SPY": 100.0}, verify_mark=lambda s: 100.0)
     assert r1.level == "critical" and r1.kill_now is False
-    r2 = evaluate_risk(ctx, {"SPY": 100.0})
+    r2 = evaluate_risk(ctx, {"SPY": 100.0}, verify_mark=lambda s: 100.0)
     assert r2.kill_now is True and r2.drawdown == pytest.approx(-0.16)
     api.set_price("SPY", 100.0)
     fire_kill_switch(ctx, api, r2, {"SPY": 100.0})
@@ -225,16 +226,20 @@ def test_implausible_equity_jump_is_suspect_and_does_not_kill(db_path):
     ctx = make_ctx("stable", api, {"SPY": None}, db_path=db_path)
     assert evaluate_risk(ctx, {"SPY": 500.0}).level == "safe"
     portfolio.adopt_position("stable", "QQQ", 10.0, 90.0, db_path)   # 900 of QQQ, cash now -100
-    glitch = evaluate_risk(ctx, {"SPY": 500.0, "QQQ": 1.0})           # QQQ marked at $1: equity collapses ~90%
-    assert glitch.level == "suspect" and glitch.kill_now is False
+    # QQQ marked at $1 with no independent quote: SUSPECT, no kill, no streak, no peak change
+    glitch = evaluate_risk(ctx, {"SPY": 500.0, "QQQ": 1.0}, verify_mark=lambda s: None)
+    assert glitch.level == "suspect" and glitch.kill_now is False and "QQQ" in glitch.suspect_symbols
     state = portfolio.get_strategy_state("stable", db_path)
     assert state["critical_streak"] == 0
     # No entries while suspect
     out = trade_ticker(ctx, api, "SPY", make_featured_df(price=500.0), glitch, allow_entries=True)
     assert out in ("entry-blocked", "hold", "no-model")
-    # A persistent reading (two cycles agreeing) is accepted as reality
-    real = evaluate_risk(ctx, {"SPY": 500.0, "QQQ": 1.0})
-    assert real.level == "critical" and real.kill_now is False   # first confirmed critical reading
+    # Third pass T-06: a repeated identical bad reading is NOT accepted as reality...
+    again = evaluate_risk(ctx, {"SPY": 500.0, "QQQ": 1.0}, verify_mark=lambda s: None)
+    assert again.level == "suspect" and again.kill_now is False
+    # ...but an independently corroborated reading is (first confirmed critical reading)
+    real = evaluate_risk(ctx, {"SPY": 500.0, "QQQ": 1.0}, verify_mark=lambda s: 1.0)
+    assert real.level == "critical" and real.kill_now is False
 
 
 def test_nan_or_inf_equity_is_rejected():

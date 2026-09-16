@@ -1,0 +1,12 @@
+# OPTIONAL: reinforcement learning (risky2 PPO inference and training).
+#
+# torch is resolved from the CPU wheel index so that a Linux install does not
+# pull the CUDA/NVIDIA packages (several GB), which exhausted Codespace storage.
+# The CPU index only hosts the torch family; everything else still comes from
+# PyPI via the extra index.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch>=2.2
+stable-baselines3>=2.3
+gymnasium>=0.29

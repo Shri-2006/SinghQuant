@@ -252,17 +252,49 @@ def test_nan_or_inf_equity_is_rejected():
     assert validate_equity(100, 1000)[0] is False
 
 
-def test_missing_marks_do_not_create_drawdown(db_path):
-    """Invariant 8: no data -> valued at entry -> no fake drawdown, no kill."""
+def test_missing_mark_without_independent_quote_is_suspect(db_path):
+    """Missing primary mark with no independent quote is suspect, never fake-safe or fake-critical."""
     api = FakeAlpaca(prices={"SPY": 500.0})
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
     ctx = make_ctx("stable", api, {"SPY": None}, db_path=db_path)
     risk = evaluate_risk(ctx, {})
-    assert risk.level == "safe" and risk.equity == pytest.approx(1000.0)
+    assert risk.level == "suspect"
+    assert risk.equity == pytest.approx(1000.0)
     assert run_cycle(ctx, api, **FAST)["tickers"]["SPY"] == "no-data"
     assert api.submitted[1:] == []
 
+def test_missing_mark_uses_broker_quote_for_held_position(db_path):
+    """Held position with no primary mark should use a valid broker quote, not entry price."""
+    api = FakeAlpaca(prices={"SPY": 500.0})
 
+    submit_and_track(
+        api, "stable", "SPY", "buy", 0.4, 500.0,
+        "missing-mark-broker-fallback",
+        db_path=db_path,
+        **FAST,
+    )
+
+    # Broker now sees an 80% asset-price drop, while the primary mark is missing.
+    api.set_price("SPY", 100.0)
+
+    ctx = make_ctx("stable", api, {"SPY": None}, db_path=db_path)
+
+    calls = []
+
+    def verify_mark(symbol):
+        calls.append(symbol)
+        return float(api.get_position(symbol).current_price)
+
+    risk = evaluate_risk(
+        ctx,
+        {},
+        verify_mark=verify_mark,
+    )
+
+    assert calls
+    assert all(symbol == "SPY" for symbol in calls)
+    assert risk.equity == pytest.approx(840.0)
+    assert risk.level == "critical"
 # ---------------------------------------------------------------------------
 # Data validity, market hours, ML feature contract
 # ---------------------------------------------------------------------------

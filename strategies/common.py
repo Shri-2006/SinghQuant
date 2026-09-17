@@ -122,14 +122,14 @@ def _bar_age_days(df, now=None):
 
 def _validate_marks(ctx, marks, bar_ages, verify_mark):
     """
-    Per-symbol INPUT validation (third pass T-06). A mark that jumped more than
-    MARK_MAX_STEP_CHANGE from the last accepted mark (or the entry price when
-    never marked), or that comes from a bar older than STALE_BAR_MAX_DAYS, is
-    trusted only if an independent broker quote agrees within
-    MARK_CROSSCHECK_TOLERANCE. If the broker quote disagrees, the broker quote
-    is used for this cycle. If no independent quote is available the symbol is
-    SUSPECT: it is valued at its last accepted mark and no action is taken on it.
-    Two identical bad bars therefore never "confirm" each other.
+    Per-symbol INPUT validation (third pass T-06).
+
+    Missing or implausible primary marks are cross-checked against an
+    independent broker quote. A valid broker quote is used for the cycle.
+    If no independent quote is available, the symbol is SUSPECT: its last
+    accepted mark / entry may still be used for valuation, but no new entry,
+    peak update, or kill-switch action is taken from that untrusted reading.
+
     Returns (accepted_marks, suspect_symbols, notes).
     """
     s = ctx.name
@@ -137,10 +137,37 @@ def _validate_marks(ctx, marks, bar_ages, verify_mark):
     last_marks = portfolio.get_last_marks(s, ctx.db_path)
     accepted = dict(marks)
     suspect, notes = [], []
+
     for symbol, (qty, avg, _) in positions.items():
         px = marks.get(symbol)
+
         if px is None:
-            continue  # strategy_equity falls back to the last accepted mark (never zero)
+            # A held position without a primary mark must not silently look flat.
+            # Prefer an independent broker quote. If that is unavailable, mark
+            # the symbol SUSPECT so this cycle cannot open positions or update
+            # the peak from an untrusted valuation.
+            quote = None
+            if verify_mark is not None:
+                try:
+                    quote = verify_mark(symbol)
+                    quote = float(quote) if quote is not None else None
+                except Exception:
+                    quote = None
+
+            if quote is not None and math.isfinite(quote) and quote > 0:
+                accepted[symbol] = quote
+                notes.append(
+                    f"{symbol}: primary mark missing; using independent quote {quote:.4f}"
+                )
+                continue
+
+            accepted.pop(symbol, None)
+            suspect.append(symbol)
+            notes.append(
+                f"{symbol}: primary mark missing; no independent quote, SUSPECT"
+            )
+            continue
+
         ref = last_marks.get(symbol) or avg
         age = (bar_ages or {}).get(symbol)
         problems = []
@@ -191,7 +218,10 @@ def evaluate_risk(ctx, marks, now=None, atr_fractions=None, bar_ages=None, verif
     stale = sorted(t for t, a in (bar_ages or {}).items() if a is not None and a > STALE_BAR_MAX_DAYS)
     equity, pos_value, missing = portfolio.strategy_equity(s, accepted, ctx.db_path)
     if missing:
-        print(f"[{s}] no validated mark for {missing}; valued at last accepted mark / entry (conservative)")
+        print(
+            f"[{s}] no validated mark for {missing}; "
+            "using last accepted mark / entry for fallback valuation only"
+        )
 
     structurally_ok = isinstance(equity, (int, float)) and math.isfinite(equity)
     if suspect or not structurally_ok:

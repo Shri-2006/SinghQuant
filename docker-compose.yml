@@ -54,6 +54,7 @@ services:
     <<: *common
     command: ["streamlit", "run", "dashboard/streamlit_app_v2.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
     environment:
+      PYTHONPATH: /app
       SINGHQUANT_DB_PATH: /app/database/trades.db
       SINGHQUANT_DB_READONLY: "1"          # never migrates or writes
     volumes:

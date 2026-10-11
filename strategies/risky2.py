@@ -11,20 +11,25 @@ Audit changes (ENGINEERING_AUDIT.md issue H-04):
 """
 from core.config import RISKY2_ASSETS, CAPITAL, POLYGON_API_KEY_RISKY2
 from data.discord_notifier import send_heartbeat, send_alert
-from strategies.common import StrategyContext, Decision, make_frame_fetcher, run_forever
+from strategies.common import StrategyContext, Decision, make_frame_fetcher, run_forever, artifact_status
 
 strategy = "risky2"
 ACTION_NAMES = {0: "HOLD", 1: "BUY", 2: "SELL"}
 
-_models = {}
+_handles = {}
+
+
+def get_handle(ticker):
+    """Verified per-ticker PPO handle, created lazily so importing this module needs no torch."""
+    if ticker not in _handles:
+        from models.rl_train import rl_model_handle
+        _handles[ticker] = rl_model_handle(ticker)
+    return _handles[ticker]
 
 
 def get_model(ticker):
-    """Loads the per-ticker PPO lazily so importing this module needs no torch."""
-    if ticker not in _models:
-        from models.rl_train import load_rl_model
-        _models[ticker] = load_rl_model(ticker)
-    return _models[ticker]
+    """The verified PPO for `ticker`, or None while its artifact does not validate (Phase 2 I-3)."""
+    return get_handle(ticker).model
 
 
 def ppo_decide(ctx, ticker, df, owned_qty, avg_entry, price):
@@ -55,6 +60,7 @@ def build_context(**overrides):
         check_account_cash=True,      # crypto needs settled account cash (restored from main, R-3)
         notify=send_heartbeat,
         alert=send_alert,
+        model_status=lambda: artifact_status(*(get_handle(t) for t in RISKY2_ASSETS))(),
     )
     for k, v in overrides.items():
         setattr(ctx, k, v)

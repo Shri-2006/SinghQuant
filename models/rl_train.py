@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 from models.rl_environment import TradingEnvironment
 from core.config import CAPITAL, MAX_POSITION_SIZE, RISKY2_ASSETS
 
+from models import artifacts
+
 STRATEGY    = "risky2"
-# Absolute path: the original "models" was relative to the current working
-# directory, so model loading depended on where the process was launched.
-MODEL_DIR   = os.path.dirname(os.path.abspath(__file__))
+# SINGHQUANT_MODEL_DIR (default: this folder). Phase 2 I-3: PPO models are
+# published and verified through models/artifacts.py like the XGBoost ones.
+MODEL_DIR   = artifacts.model_dir()
 
 # Default crypto tickers to train on
 DEFAULT_TICKERS = list(RISKY2_ASSETS)
@@ -16,11 +18,10 @@ DEFAULT_TICKERS = list(RISKY2_ASSETS)
 
 def get_model_path(ticker):
     """
-    Returns model path for a specific ticker.
-    X:BTCUSD → models/risky2_BTCUSD.zip
+    Logical artifact path for a ticker (X:BTCUSD -> <model dir>/risky2_BTCUSD.zip).
+    The file actually loaded is the content-addressed one the manifest names.
     """
-    clean = ticker.replace("X:", "").replace("/", "")
-    return os.path.join(MODEL_DIR, f"risky2_{clean}.zip")
+    return os.path.join(artifacts.model_dir(), artifacts.rl_artifact_name(ticker))
 
 
 def prepare_rl_data(ticker, days_to_look_back=365):
@@ -79,12 +80,15 @@ def train_rl_model(ticker="X:BTCUSD", days_to_look_back=365, timesteps=100000):
         seed=42
     )
 
-    model_path = get_model_path(ticker)
     print(f"Training {ticker} for {timesteps} timesteps...")
     model.learn(total_timesteps=timesteps)
 
-    model.save(model_path)
-    print(f"Model saved to {model_path}")
+    import stable_baselines3
+    from datetime import datetime, timezone
+    artifacts.publish(artifacts.rl_artifact_name(ticker), lambda tmp: model.save(tmp), STRATEGY,
+                      datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                      meta={"ticker": ticker, "timesteps": timesteps, "days_to_look_back": days_to_look_back,
+                            "stable_baselines3": stable_baselines3.__version__})
     return model
 
 
@@ -116,27 +120,27 @@ def train_all_tickers(tickers=None, days_to_look_back=365, timesteps=100000):
     return results
 
 
-def load_rl_model(ticker="X:BTCUSD"):
-    """
-    Loads trained PPO model for a specific ticker.
-    Returns None if no model exists yet — bot will skip trading.
-    Falls back to legacy risky2_model.zip if ticker model not found.
-    """
+def _load_ppo(path):
     from stable_baselines3 import PPO
-    model_path = get_model_path(ticker)
+    return PPO.load(path)
 
-    if os.path.exists(model_path):
-        print(f"Loading model for {ticker} from {model_path}")
-        return PPO.load(model_path)
 
-    # Legacy fallback
-    legacy_path = os.path.join(MODEL_DIR, "risky2_model.zip")
-    if os.path.exists(legacy_path):
-        print(f"No ticker model found for {ticker}, using legacy model")
-        return PPO.load(legacy_path)
+def _check_ppo(model):
+    return None if hasattr(model, "predict") else "object has no predict()"
 
-    print(f"No RL model found for {ticker} — needs training first")
-    return None
+
+def rl_model_handle(ticker, directory=None):
+    """
+    Verified, hot-reloading PPO model for one ticker (Phase 2 I-3). The old
+    silent fallback to an unverified risky2_model.zip is gone: register that
+    file under each ticker's name with tools/model_manifest.py if it is wanted.
+    """
+    return artifacts.ArtifactHandle(artifacts.rl_artifact_name(ticker), _load_ppo, _check_ppo, directory)
+
+
+def load_rl_model(ticker="X:BTCUSD"):
+    """The verified PPO model for `ticker`, or None (the bot then takes no entries for it)."""
+    return rl_model_handle(ticker).model
 
 
 if __name__ == "__main__":

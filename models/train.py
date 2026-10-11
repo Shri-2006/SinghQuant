@@ -13,16 +13,24 @@ Audit changes (ENGINEERING_AUDIT.md issues M-02, M-03, H-06, ML section):
   * risky1 trains on RISKY1_ASSETS instead of the ["SPY"] placeholder.
   * ModelHandle reloads a .pkl when its mtime changes so retraining takes
     effect without a restart; missing models no longer crash import.
+  * Phase 2 I-3: models live in SINGHQUANT_MODEL_DIR and are published and
+    verified through models/artifacts.py (manifest + SHA-256). ModelHandle
+    only returns a model whose hash matches the manifest and whose feature
+    width matches FEATURE_COLUMNS; otherwise the strategy takes no new
+    entries (existing positions are still risk-managed).
 """
 import os
+from datetime import datetime, timezone
 import pickle #to save python objects to file and go back. XGBoost will use .pkl file type
 import numpy as np #numpy is used by XGBoost and sklearn for math operations in arrays
 import pandas as pd #DataFrames library
 from core.features import build_features #OHLCV into indicators, i built this
 from core.config import STABLE_ASSETS, RISKY1_ASSETS, RETRAIN_INTERVAL_DAYS
 
-#Location of saved trained models
-MODEL_DIR= os.path.join(os.path.dirname(__file__))
+from models import artifacts
+
+#Location of saved trained models (SINGHQUANT_MODEL_DIR, default: this folder)
+MODEL_DIR = artifacts.model_dir()
 
 # Exact feature layout the models are trained on and fed at inference.
 # Order matters: XGBoost consumes a positional numpy array.
@@ -114,60 +122,63 @@ def train_model(X_train, Y_train, X_test=None, Y_test=None):
     return model, accuracy
 
 
-def save_model(model,filename):
+def _strategy_for(filename):
+    return filename.split("_model")[0] if "_model" in filename else None
+
+
+def save_model(model, filename, version=None, meta=None, directory=None):
     """
-    Time to save the trained model in .pkl file. The filename is going to be something like "stable_model.pkl"
+    Publishes a trained model atomically (temp file + fsync + content-addressed
+    name) and records it in the manifest with its SHA-256. Running bots pick it
+    up on their next cycle. The filename is the LOGICAL name, e.g. "stable_model.pkl".
     """
-    path=os.path.join(MODEL_DIR,filename)
-    with open(path,'wb') as f:
-        pickle.dump(model,f)
-    print(f"Model saved to {path}")
+    def write(tmp):
+        with open(tmp, 'wb') as f:
+            pickle.dump(model, f)
+    version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return artifacts.publish(filename, write, _strategy_for(filename), version, meta, directory)
+
+
+def _load_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 def load_model(filename):
     """
-    Load the saved model from file.  The filename is going to be something like "stable_model.pkl" again
+    Loads a model for offline use (backtests). A registered model is verified
+    against the manifest first; an unregistered legacy file in the model
+    directory is loaded with a warning (live trading never does this).
     """
-    path=os.path.join(MODEL_DIR,filename)
-    with open(path,'rb')as f:
-        model=pickle.load(f)
-    return model
+    try:
+        _, path = artifacts.verify(filename)
+    except artifacts.ArtifactError as e:
+        if e.status != artifacts.UNREGISTERED:
+            raise
+        path = os.path.join(artifacts.model_dir(), filename)
+        print(f"[models] WARNING: {filename} is not in the manifest; loading the unverified file for offline use")
+    return _load_pickle(path)
 
 
-class ModelHandle:
+def check_feature_width(model):
+    """None if `model` accepts the live feature layout, else a description of the mismatch."""
+    if not hasattr(model, "predict"):
+        return "object has no predict()"
+    expected = getattr(model, "n_features_in_", None)
+    if expected is not None and expected != len(FEATURE_COLUMNS):
+        return f"model expects {expected} features, live inference provides {len(FEATURE_COLUMNS)}"
+    return None
+
+
+class ModelHandle(artifacts.ArtifactHandle):
     """
-    Lazily loads a model file and transparently reloads it when the file
-    changes on disk (retraining). `.model` is None when no file exists, and
-    strategies then skip entries instead of crashing at import.
+    Verified, hot-reloading XGBoost model for a strategy. `.model` is None
+    unless the artifact is registered, present, matches its SHA-256 and has
+    the right feature width; `.status` / `.detail` explain why not.
     """
-    def __init__(self, filename):
+    def __init__(self, filename, directory=None):
+        super().__init__(filename, _load_pickle, check_feature_width, directory)
         self.filename = filename
-        self.path = os.path.join(MODEL_DIR, filename)
-        self._model = None
-        self._mtime = None
-
-    @property
-    def model(self):
-        try:
-            mtime = os.path.getmtime(self.path)
-        except OSError:
-            if self._model is None:
-                print(f"[models] {self.filename} not found in {MODEL_DIR}; strategy will not open new positions")
-            return self._model
-        if self._model is None or mtime != self._mtime:
-            try:
-                self._model = load_model(self.filename)
-                self._mtime = mtime
-                print(f"[models] loaded {self.filename} (mtime {mtime})")
-            except Exception as e:
-                print(f"[models] failed to load {self.filename}: {e}")
-        return self._model
-
-    def predict(self, X):
-        m = self.model
-        if m is None:
-            return None
-        return m.predict(X)
 
 
 def train_and_save(strategy, start, end, test_size=0.2, delay=12):
@@ -197,7 +208,13 @@ def train_and_save(strategy, start, end, test_size=0.2, delay=12):
         print(f"No training data for {strategy}; model not updated")
         return None
     model,accuracy=train_model(np.vstack(Xtr),np.concatenate(Ytr),np.vstack(Xte),np.concatenate(Yte))
-    save_model(model,filename)
+    import sklearn, xgboost
+    save_model(model, filename, meta={
+        "train_start": start, "train_end": end, "tickers": list(data.keys()),
+        "out_of_time_accuracy": None if accuracy is None else float(accuracy),
+        "feature_columns": FEATURE_COLUMNS, "n_features": len(FEATURE_COLUMNS),
+        "xgboost": xgboost.__version__, "scikit_learn": sklearn.__version__,
+    })
     print(f"{strategy} model was trained; out-of-time accuracy {accuracy: .2%}")
     return model, accuracy
 

@@ -191,3 +191,7 @@ HEARTBEAT_STALE_SECONDS = 600
 # position is liquidated because of an API outage.
 SUSPECT_ALERT_AFTER_CYCLES = 3
 SUSPECT_ALERT_REPEAT_CYCLES = 12
+
+# Phase 2 I-3: an unavailable or invalid model is alerted when first seen and
+# again every MODEL_ALERT_REPEAT_SECONDS while it persists (alerting only).
+MODEL_ALERT_REPEAT_SECONDS = 6 * 3600

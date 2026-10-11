@@ -28,7 +28,7 @@ from core import portfolio
 from core.config import (CAPITAL, MAX_POSITION_SIZE, MIN_HOLD_SECONDS, ONE_ACTION_PER_BAR,
                          KILL_SWITCH_CONFIRMATIONS, STRATEGY_ASSETS, MIN_TOPUP_FRACTION,
                          MARK_MAX_STEP_CHANGE, STALE_BAR_MAX_DAYS, MARK_CROSSCHECK_TOLERANCE,
-                         SUSPECT_ALERT_AFTER_CYCLES, SUSPECT_ALERT_REPEAT_CYCLES)
+                         SUSPECT_ALERT_AFTER_CYCLES, SUSPECT_ALERT_REPEAT_CYCLES, MODEL_ALERT_REPEAT_SECONDS)
 from core.execution import (submit_and_track, close_strategy_position, close_all_strategy_positions,
                             reconcile_open_orders, to_broker_symbol, BrokerQuote, broker_quote,
                             record_discrepancy)
@@ -86,6 +86,10 @@ class StrategyContext:
     # guard, commit 523f7f6: crypto cannot be bought on margin). Fails closed. (R-3)
     check_account_cash: bool = False
     runtime: dict = field(default_factory=dict)                    # per-process state (alert de-duplication)
+    # Phase 2 I-3: () -> (ok, reason). ok=False means the strategy's model
+    # artifacts do not validate: new entries are blocked (the decider gets no
+    # model) while stops, momentum exits and the kill switch keep running.
+    model_status: Callable[[], tuple] = lambda: (True, "")
 
 
 def utcnow():
@@ -712,6 +716,62 @@ def _alert_negative_budget(ctx, equity):
         ctx.runtime["negative_budget_alerted"] = False
 
 
+def artifact_status(*handles):
+    """model_status callable for StrategyContext over one or more verified artifact handles."""
+    def status():
+        problems = [f"{h.name}: {h.status} ({h.detail})" for h in handles if not h.ready]
+        if problems:
+            return False, f"{len(problems)}/{len(handles)} model artifact(s) unusable: " + "; ".join(problems)
+        return True, ""
+    return status
+
+
+def _check_models(ctx, now=None):
+    """Evaluates the model artifacts and alerts on loss (repeated) and on recovery (Phase 2 I-3)."""
+    try:
+        ok, reason = ctx.model_status()
+    except Exception as e:
+        ok, reason = False, f"model status check failed: {e}"
+    now = now or utcnow()
+    last = ctx.runtime.get("model_alert_at")
+    if not ok:
+        if last is None or (now - last).total_seconds() >= MODEL_ALERT_REPEAT_SECONDS:
+            _safe_alert(ctx, "MODEL UNAVAILABLE",
+                        f"{ctx.name}: {reason}. NEW ENTRIES ARE BLOCKED for the affected model(s); stop losses, "
+                        "momentum exits and the kill switch keep managing existing positions. Publish or register "
+                        "the model (tools/model_manifest.py) to restore entries.", None)
+            ctx.runtime["model_alert_at"] = now
+    elif last is not None:
+        _safe_alert(ctx, "MODEL RESTORED", f"{ctx.name}: all model artifacts verify again; entries re-enabled.", None)
+        ctx.runtime.pop("model_alert_at", None)
+    return ok, reason
+
+
+def _readiness(model_ok, model_reason, risk=None, trading_state=None, extra_reasons=()):
+    """
+    (ready, degraded_reason) for the heartbeat. ready = the strategy may open
+    NEW entries. Not ready / degraded never means "dead": exits and the kill
+    switch keep running (Phase 2 I-4 separates this from liveness).
+    """
+    blocking, notes = [], []
+    if not model_ok:
+        blocking.append(model_reason)
+    if risk is not None:
+        if risk.halted:
+            blocking.append("halted by kill switch")
+        elif risk.level == "suspect":
+            blocking.append(f"risk reading suspect ({risk.reason})")
+        elif risk.level == "critical":
+            blocking.append("critical drawdown")
+        if risk.discrepancy_symbols:
+            notes.append(f"ledger discrepancy flagged for {risk.discrepancy_symbols}")
+    if trading_state == "HALT":
+        blocking.append("equity-curve filter HALT")
+    blocking.extend(r for r in extra_reasons if r)
+    reasons = blocking + notes
+    return (not blocking), ("; ".join(reasons) if reasons else None)
+
+
 def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     """
     One full cycle for a strategy. Returns a dict summarising what happened so
@@ -724,13 +784,19 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
         reconcile_open_orders(api, s, ctx.db_path)
     except Exception as e:  # reconciliation must never take the whole cycle down (second-pass S-04)
         print(f"[{s}] order reconciliation failed: {e}")
+    model_ok, model_reason = _check_models(ctx, now)
+    summary["model_ok"], summary["model_reason"] = model_ok, model_reason
 
     if ctx.uses_market_hours:
         from paper_trading.alpaca_paper import sleep_seconds_until_open
         secs = sleep_seconds_until_open(api.get_clock())
         if secs > 0:
-            log_heartbeat(s, "PAUSED", ctx.db_path)
+            halted = portfolio.get_strategy_state(s, ctx.db_path)["halted"]
+            ready, degraded = _readiness(model_ok, model_reason,
+                                         extra_reasons=["halted by kill switch"] if halted else ())
+            log_heartbeat(s, "PAUSED", ctx.db_path, ready=ready, degraded_reason=degraded)
             summary["paused"] = secs
+            summary["ready"], summary["degraded_reason"] = ready, degraded
             return summary
 
     # Symbols to manage: the configured universe PLUS anything the ledger still
@@ -778,7 +844,9 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     _alert_suspect_state(ctx, risk)
     _alert_negative_budget(ctx, risk.equity)
     if risk.halted:
-        log_heartbeat(s, "HALTED", ctx.db_path)
+        ready, degraded = _readiness(model_ok, model_reason, risk)
+        summary["ready"], summary["degraded_reason"] = ready, degraded
+        log_heartbeat(s, "HALTED", ctx.db_path, ready=ready, degraded_reason=degraded)
         summary["halted"] = True
         # Keep trying to flatten anything the kill switch could not close
         # (rejected or pending sells): a halted strategy must not carry open risk
@@ -793,7 +861,9 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     if risk.kill_now:
         fire_kill_switch(ctx, api, risk, marks)
         summary["killed"] = True
-        log_heartbeat(s, "HALTED", ctx.db_path)
+        ready, degraded = _readiness(model_ok, model_reason, risk, extra_reasons=["kill switch fired"])
+        summary["ready"], summary["degraded_reason"] = ready, degraded
+        log_heartbeat(s, "HALTED", ctx.db_path, ready=ready, degraded_reason=degraded)
         return summary
 
     from metrics.equity_curve_filter import get_trading_state
@@ -812,7 +882,10 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
         log_heartbeat(s, "RUNNING", ctx.db_path)
 
     _alert_new_discrepancies(ctx, risk.equity)     # flags raised by sells during this cycle
-    log_heartbeat(s, "SUSPECT" if risk.level == "suspect" else "RUNNING", ctx.db_path)
+    ready, degraded = _readiness(model_ok, model_reason, risk, state)
+    summary["ready"], summary["degraded_reason"] = ready, degraded
+    log_heartbeat(s, "SUSPECT" if risk.level == "suspect" else "RUNNING", ctx.db_path,
+                  ready=ready, degraded_reason=degraded)
     return summary
 
 

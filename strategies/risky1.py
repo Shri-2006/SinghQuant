@@ -10,7 +10,8 @@ from core.config import RISKY1_ASSETS, POLYGON_API_KEY_RISKY1
 from models.train import ModelHandle
 from models.regime_detector import get_regime_for_strategy
 from data.discord_notifier import send_heartbeat, send_alert
-from strategies.common import StrategyContext, xgb_decider, make_frame_fetcher, effective_vix, run_forever
+from strategies.common import (StrategyContext, xgb_decider, make_frame_fetcher, effective_vix, run_forever,
+                               artifact_status)
 
 strategy = "risky1"
 model_handle = ModelHandle("risky1_model.pkl")
@@ -30,6 +31,7 @@ def build_context(**overrides):
         regime_ok=get_regime_for_strategy,
         notify=send_heartbeat,
         alert=send_alert,
+        model_status=artifact_status(model_handle),
     )
     for k, v in overrides.items():
         setattr(ctx, k, v)

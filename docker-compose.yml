@@ -3,7 +3,7 @@
 #
 # Start order: migrate (one-shot schema migration) -> trading_bots + dashboard.
 # Host directories:
-#   ./data             trades.db AND its -wal / -shm files (one shared directory)
+#   ./database         trades.db AND its -wal / -shm files (one shared directory)
 #   ./model_artifacts  model files + manifest.json (bots only; survives rebuilds)
 
 x-common: &common
@@ -23,19 +23,19 @@ services:
     <<: *common
     command: ["python", "-m", "tools.db_maintenance", "migrate"]
     environment:
-      SINGHQUANT_DB_PATH: /app/data/trades.db
+      SINGHQUANT_DB_PATH: /app/database/trades.db
     volumes:
-      - ./data:/app/data
+      - ./database:/app/database
     restart: "no"                # one-shot: a failure must stop the stack, not loop
 
   trading_bots:
     <<: *common
     command: ["python", "run.py"]
     environment:
-      SINGHQUANT_DB_PATH: /app/data/trades.db
+      SINGHQUANT_DB_PATH: /app/database/trades.db
       SINGHQUANT_MODEL_DIR: /app/model_artifacts
     volumes:
-      - ./data:/app/data
+      - ./database:/app/database
       - ./model_artifacts:/app/model_artifacts
     depends_on:
       migrate:
@@ -54,10 +54,10 @@ services:
     <<: *common
     command: ["streamlit", "run", "dashboard/streamlit_app_v2.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
     environment:
-      SINGHQUANT_DB_PATH: /app/data/trades.db
+      SINGHQUANT_DB_PATH: /app/database/trades.db
       SINGHQUANT_DB_READONLY: "1"          # never migrates or writes
     volumes:
-      - ./data:/app/data                   # read-write mount: SQLite readers still need the -shm file
+      - ./database:/app/database                       # read-write mount: SQLite readers still need the -shm file
     ports:
       - "8501:8501"                        # host:container
     depends_on:

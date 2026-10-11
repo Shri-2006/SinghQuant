@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # SINGHQUANT_DB_PATH lets tests, tooling and containers point at another
-# database file. In Docker it is /app/data/trades.db on a DIRECTORY volume, so
+# database file. In Docker it is /app/database/trades.db on a DIRECTORY volume, so
 # the -wal and -shm files live next to the database on the host (Phase 2 I-1).
 DB_PATH = os.getenv("SINGHQUANT_DB_PATH") or os.path.join(os.path.dirname(__file__), '..', 'trades.db')
 

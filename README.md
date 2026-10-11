@@ -139,7 +139,7 @@ python -m pytest tests/ -q
 python run.py
 streamlit run dashboard/streamlit_app_v2.py
 ```
-or with Docker: `docker compose up -d`. A one-shot `migrate` service runs first; the bots and the read-only dashboard (port 8501) start only if it succeeds. The database and its `-wal`/`-shm` files live together in `./data/`, and model artifacts in `./model_artifacts/` (bots only). **A host that ran the old layout (`./trades.db` mounted as a single file) must follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) first**: the old container holds un-checkpointed commits.
+or with Docker: `docker compose up -d`. A one-shot `migrate` service runs first; the bots and the read-only dashboard (port 8501) start only if it succeeds. The database and its `-wal`/`-shm` files live together in `./database/`, and model artifacts in `./model_artifacts/` (bots only). **A host that ran the old layout (`./trades.db` mounted as a single file) must follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) first**: the old container holds un-checkpointed commits.
 
 Operations (Phase 2):
 - `python -m tools.healthcheck report|liveness|readiness`: liveness (heartbeat fresh) is what Docker checks; readiness (may open new entries) and degraded reasons are reported separately.

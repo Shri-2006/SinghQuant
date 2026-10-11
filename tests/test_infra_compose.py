@@ -27,13 +27,13 @@ def test_database_is_on_a_directory_volume_never_a_single_file_mount(compose):
         for host, container, *_ in _volumes(svc):
             assert not host.endswith(".db") and not container.endswith(".db"), f"{name}: single-file DB mount"
         if "SINGHQUANT_DB_PATH" in svc.get("environment", {}):
-            assert svc["environment"]["SINGHQUANT_DB_PATH"] == "/app/data/trades.db"
-            assert ["./data", "/app/data"] in _volumes(svc), f"{name}: database directory not mounted"
+            assert svc["environment"]["SINGHQUANT_DB_PATH"] == "/app/database/trades.db"
+            assert ["./database", "/app/database"] in _volumes(svc), f"{name}: database directory not mounted"
 
 
 def test_every_service_shares_the_same_database_directory(compose):
     paths = {svc["environment"]["SINGHQUANT_DB_PATH"] for svc in compose["services"].values()}
-    assert paths == {"/app/data/trades.db"}
+    assert paths == {"/app/database/trades.db"}
 
 
 def test_one_shot_migration_runs_first_and_does_not_restart(compose):
@@ -77,9 +77,9 @@ def test_logs_are_rotated(compose):
 def test_runtime_state_never_enters_the_image_or_git():
     docker_ignore = open(os.path.join(ROOT, ".dockerignore")).read().split()
     git_ignore = open(os.path.join(ROOT, ".gitignore")).read().split()
-    for entry in ("data/", "model_artifacts/", "*.db", "*.pkl"):
+    for entry in ("database/", "model_artifacts/", "*.db", "*.pkl"):
         assert entry in docker_ignore, entry
-    for entry in ("/data/", "/model_artifacts/"):
+    for entry in ("/database/", "/model_artifacts/"):
         assert entry in git_ignore, entry
 
 
@@ -96,7 +96,7 @@ def test_dockerfile_invariants():
     d = _read("Dockerfile")
     assert "FROM python:3.11-slim-bookworm" in d                 # pinned distro -> stable glibc / wheel tags
     assert "PIP_NO_CACHE_DIR=1" in d
-    assert "SINGHQUANT_DB_PATH=/app/data/trades.db" in d and "SINGHQUANT_MODEL_DIR=/app/model_artifacts" in d
+    assert "SINGHQUANT_DB_PATH=/app/database/trades.db" in d and "SINGHQUANT_MODEL_DIR=/app/model_artifacts" in d
     assert "bash setup.sh --pinned --with-rl" in d
     assert "python -m tools.smoke_imports --require-rl" in d    # the build fails if the CPU's wheels do not work
     assert "STOPSIGNAL SIGTERM" in d
@@ -129,3 +129,59 @@ def test_smoke_imports_pass_without_network_or_credentials(tmp_path):
     assert r.returncode == 0, r.stdout[-500:] + r.stderr[-1500:]
     assert "smoke test ok" in r.stdout
     assert not os.path.exists(os.path.join(ROOT, "trades.db"))
+
+
+# ---------------------------------------------------------------------------
+# Guard: runtime directories must never collide with source code. The first
+# Phase 2 draft used ./data for the database, which is also the `data`
+# package (polygon/sentiment/macro fetchers): the volume would have hidden the
+# code in every container and .dockerignore would have dropped it from the image.
+# ---------------------------------------------------------------------------
+
+def _source_files():
+    out = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__", ".pytest_cache")]
+        for f in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, f), ROOT).replace(os.sep, "/")
+            if rel.endswith((".py", ".txt", ".sh", ".yml", ".md")) and not rel.startswith(("database/", "model_artifacts/", "cutover/")):
+                out.append(rel)
+    return out
+
+
+def test_no_volume_shadows_source_code(compose):
+    sources = _source_files()
+    for name, svc in compose["services"].items():
+        for host, container, *_ in _volumes(svc):
+            assert container.startswith("/app/"), container
+            sub = container[len("/app/"):].rstrip("/") + "/"
+            shadowed = [s for s in sources if s.startswith(sub)]
+            assert shadowed == [], f"{name}: mounting {container} hides source files {shadowed[:5]}"
+
+
+def test_dockerignore_does_not_drop_source_files():
+    import fnmatch
+    patterns = [l.strip() for l in open(os.path.join(ROOT, ".dockerignore")).read().splitlines()
+                if l.strip() and not l.startswith("#")]
+    dropped = []
+    for rel in _source_files():
+        if not rel.endswith(".py"):
+            continue
+        for pat in patterns:
+            if pat.endswith("/"):
+                hit = rel.startswith(pat) or ("/" + pat) in ("/" + rel)
+            else:
+                hit = fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(os.path.basename(rel), pat)
+            if hit:
+                dropped.append((rel, pat))
+    assert dropped == [], dropped
+
+
+def test_gitignore_does_not_ignore_tracked_source():
+    import shutil, subprocess
+    if shutil.which("git") is None or not os.path.isdir(os.path.join(ROOT, ".git")):
+        pytest.skip("not a git checkout (e.g. inside the image)")
+    tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True).stdout.split()
+    r = subprocess.run(["git", "check-ignore", "--no-index", "--stdin"], cwd=ROOT, input="\n".join(tracked),
+                       capture_output=True, text=True)
+    assert r.stdout.split() == [], f"tracked files matched by .gitignore: {r.stdout.split()[:10]}"

@@ -94,7 +94,7 @@ def test_storage_check_explains_a_docker_created_directory(tmp_path):
     db = tmp_path / "trades.db"
     db.mkdir()                                                   # what Docker does for a missing bind-mounted file
     problems = storage_problems(str(db))
-    assert len(problems) == 1 and "is a directory" in problems[0] and "./data:/app/data" in problems[0]
+    assert len(problems) == 1 and "is a directory" in problems[0] and "./database:/app/database" in problems[0]
 
 
 def test_storage_check_reports_missing_and_unwritable_directories(tmp_path, monkeypatch):

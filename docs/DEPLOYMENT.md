@@ -2,7 +2,7 @@
 
 This is the one-time move from the old layout (`main`: `./trades.db` bind-mounted
 as a single file, models inside the container) to the Phase 2 layout
-(`./data/` and `./model_artifacts/` host directories, one-shot `migrate`
+(`./database/` and `./model_artifacts/` host directories, one-shot `migrate`
 service, read-only dashboard).
 
 **Nothing in this document has been executed by the authors.** It is written
@@ -88,10 +88,10 @@ docker compose build                      # the build runs tools/smoke_imports.p
 ## 5. Import the database
 
 ```bash
-mkdir -p data
+mkdir -p database
 docker compose run --rm --no-deps -v "$PWD/cutover:/cutover:ro" migrate \
   python -m tools.db_maintenance cutover-import \
-    --db /cutover/trades.db.orig --wal /cutover/bots.trades.db-wal --dest /app/data/trades.db
+    --db /cutover/trades.db.orig --wal /cutover/bots.trades.db-wal --dest /app/database/trades.db
 # (omit --wal if step 3 found no bots WAL file)
 docker compose run --rm --no-deps migrate                                  # schema migration (transactional)
 docker compose run --rm --no-deps migrate python -m tools.db_maintenance check
@@ -140,7 +140,7 @@ Then, within the first cycle:
 docker compose exec trading_bots python -m tools.healthcheck report       # alive / ready / degraded per strategy
 docker compose exec trading_bots python -m tools.reconcile_position       # ledger discrepancies (should be none)
 docker compose exec trading_bots python -m tools.safe_mode status
-ls -la data/                                                              # trades.db, trades.db-wal, trades.db-shm together
+ls -la database/                                                              # trades.db, trades.db-wal, trades.db-shm together
 ```
 
 Compare positions and orders with the notes from step 0. If you used adopt,
@@ -150,7 +150,7 @@ remove the flag from `.env` and run `docker compose up -d trading_bots`.
 
 * Keep `cutover/` and the old images (`docker image ls`) for at least two weeks.
 * Online backup at any time (safe while the bots run; uses the backup API):
-  `docker compose exec trading_bots python -m tools.db_maintenance backup /app/data/backups/trades-$(date +%F).db`
+  `docker compose exec trading_bots python -m tools.db_maintenance backup /app/database/backups/trades-$(date +%F).db`
 * Stop: `docker compose stop` sends SIGTERM. The bots finish their current
   step and exit within the 60 s grace period, recorded as a clean stop.
 
@@ -180,4 +180,4 @@ flag, cross-strategy liquidation, unenforced budgets, ...).
 | Ledger discrepancy | `LEDGER DISCREPANCY` alert | `python -m tools.reconcile_position` |
 | Crash loop (3 unclean exits/hour) | `CRASH LOOP: SAFE MODE` alert; no new entries | find the cause, then `python -m tools.safe_mode clear --note ... --confirm` |
 | Thread died, restart budget spent | `STRATEGY THREAD FAILED - NOT RESTARTING` | that strategy's positions are unmanaged: intervene now |
-| Storage/schema error at start | `STARTUP FAILED` alert, exit 2 after 5 min | fix `./data` (see the message), `docker compose up -d` |
+| Storage/schema error at start | `STARTUP FAILED` alert, exit 2 after 5 min | fix `./database` (see the message), `docker compose up -d` |

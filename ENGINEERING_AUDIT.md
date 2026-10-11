@@ -803,7 +803,7 @@ readiness and degraded reporting), D2-A (watchdog restart with persistent
 crash-loop detection and safe startup reconciliation), D3-A (one-shot migration
 service, transactional migrations, read-only dashboard), D4 (the repository is
 public, so CI uses native `ubuntu-24.04-arm` runners), D5 (log rotation,
-`./data` and `./model_artifacts`, root user kept, `xgboost` unchanged).
+`./database` and `./model_artifacts`, root user kept, `xgboost` unchanged).
 **Trading logic, budgets and risk thresholds are unchanged.** Every new gate
 blocks only NEW entries. Validation used fake brokers and temporary databases
 only; nothing was deployed and no image was built in the sandbox (no Docker
@@ -811,7 +811,7 @@ daemon). The image is built and tested by CI on amd64 and arm64.
 
 | ID | Problem | Change | Evidence |
 |---|---|---|---|
-| I-1 | Single-file DB mount left `-wal`/`-shm` in each container; un-checkpointed commits lost on recreate | `./data` directory volume for every service; `core/storage.py` explicit errors (directory created by Docker, missing or unwritable directory, failed `quick_check`); `tools/db_maintenance.py` (`migrate`, `check`, `checkpoint`, `backup` via the backup API, `cutover-import` from copies); runbook `docs/DEPLOYMENT.md` | `test_infra_storage.py` (12): a writer killed without closing shows the old layout loses commits and `cutover-import` recovers all of them |
+| I-1 | Single-file DB mount left `-wal`/`-shm` in each container; un-checkpointed commits lost on recreate | `./database` directory volume for every service; `core/storage.py` explicit errors (directory created by Docker, missing or unwritable directory, failed `quick_check`); `tools/db_maintenance.py` (`migrate`, `check`, `checkpoint`, `backup` via the backup API, `cutover-import` from copies); runbook `docs/DEPLOYMENT.md` | `test_infra_storage.py` (12): a writer killed without closing shows the old layout loses commits and `cutover-import` recovers all of them |
 | I-2 | Bot and dashboard migrating at once: 34 crashes in 80 starts | One `BEGIN IMMEDIATE` transaction plus a `user_version` stamp; fast path takes no lock; `SchemaTooNew`; WAL switch retried (SQLite fails it without the busy handler); one-shot `migrate` service; dashboard `SINGHQUANT_DB_READONLY=1` | `test_infra_migrations.py` (16); race probe: 40 failures in 80 starts before, 0 in 200 after; the 4-process test fails 9/10 trials without the WAL retry |
 | I-3 | Models not persisted; a missing model meant silent no-trading | `SINGHQUANT_MODEL_DIR` volume; `models/artifacts.py` content-addressed atomic publish and `manifest.json` (file, SHA-256, version, metadata, previous entry); hash verified before unpickling; status reported in the heartbeat; alerts every 6 h and on recovery; `tools/model_manifest.py` | `test_infra_models.py` (18): tampered file never unpickled; reader never sees a broken artifact during 15 concurrent publishes |
 | I-4 | No SIGTERM handling (SIGKILL after 10 s); heartbeat stale for up to 48 h while paused; no health checks; thread death unnoticed; unlimited restarts | SIGTERM handler plus `init: true`; interruptible, chunked sleeps; `tools/healthcheck.py` (liveness vs readiness vs report); watchdog distinguishes dead or hung (restart) from degraded (keep running); `core/lifecycle.py` crash-loop accounting and persistent SAFE MODE; restart budget; startup reconciliation gate; reconcile before adopt | `test_infra_lifecycle.py` (25), including a real-process SIGTERM test and its control; `test_infra_compose.py` (11) |

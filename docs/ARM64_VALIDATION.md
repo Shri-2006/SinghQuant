@@ -83,7 +83,7 @@ grep -iE '^(numpy|pandas|xgboost|scikit-learn|torch|websockets|aiohttp|pyyaml|ms
 printf 'ALPACA_API_KEY=dummy\nALPACA_SECRET_KEY=dummy\nPOLYGON_API_KEY=dummy\n' > .env
 docker compose -p singhquant-staging up -d
 docker compose -p singhquant-staging ps                     # migrate Exited (0); others Up
-ls -la data/                                                # trades.db (+ -wal / -shm) on the host
+ls -la database/                                                # trades.db (+ -wal / -shm) on the host
 time docker compose -p singhquant-staging stop trading_bots # should take seconds, not the 60 s grace period
 docker compose -p singhquant-staging run --rm --no-deps migrate python -m tools.safe_mode status   # last run: clean
 docker compose -p singhquant-staging down

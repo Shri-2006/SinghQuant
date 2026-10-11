@@ -1,8 +1,8 @@
 """
 Database storage checks (Phase 2 I-1).
 
-In Docker the database lives at /app/data/trades.db on a DIRECTORY volume
-(./data on the host) so that SQLite's write-ahead log (trades.db-wal) and
+In Docker the database lives at /app/database/trades.db on a DIRECTORY volume
+(./database on the host) so that SQLite's write-ahead log (trades.db-wal) and
 shared-memory index (trades.db-shm), which are always created next to the
 database file, are persistent and shared by every container. The old
 single-file mount (./trades.db:/app/trades.db) left those two files inside
@@ -23,10 +23,10 @@ def storage_problems(db_path, need_write=True):
     parent = p.parent if str(p.parent) else Path(".")
     if p.is_dir():
         problems.append(f"{p} is a directory, not a database file. Docker creates a directory when a "
-                        "bind-mounted host file does not exist; mount the data DIRECTORY instead (./data:/app/data).")
+                        "bind-mounted host file does not exist; mount the data DIRECTORY instead (./database:/app/database).")
         return problems
     if not parent.is_dir():
-        problems.append(f"database directory {parent} does not exist (is the ./data volume mounted?)")
+        problems.append(f"database directory {parent} does not exist (is the ./database volume mounted?)")
         return problems
     if need_write and not os.access(parent, os.W_OK):
         problems.append(f"database directory {parent} is not writable; SQLite must create "

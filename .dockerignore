@@ -7,7 +7,7 @@ __pycache__/
 backtesting/results/
 .venv/
 venv/
-data/
+database/
 model_artifacts/
 cutover/
 trades.db*

@@ -8,7 +8,7 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    SINGHQUANT_DB_PATH=/app/data/trades.db \
+    SINGHQUANT_DB_PATH=/app/database/trades.db \
     SINGHQUANT_MODEL_DIR=/app/model_artifacts
 # PYTHONUNBUFFERED: print() reaches `docker logs` immediately.
 # The database and models live on volumes (see docker-compose.yml), never in the image.
@@ -23,7 +23,7 @@ RUN bash setup.sh --pinned --with-rl
 COPY . .
 
 # Fails the build if anything does not import or the native wheels do not work on this CPU.
-RUN mkdir -p /app/data /app/model_artifacts \
+RUN mkdir -p /app/database /app/model_artifacts \
  && python -m tools.smoke_imports --require-rl
 
 STOPSIGNAL SIGTERM

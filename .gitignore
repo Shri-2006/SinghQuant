@@ -49,6 +49,6 @@ trades.db
 *.csv
 
 # Phase 2: runtime state on host volumes (never commit or bake into images)
-/data/
+/database/
 /model_artifacts/
 /cutover/

@@ -14,6 +14,7 @@ import math
 import subprocess
 import sys
 import os
+from datetime import timedelta
 
 import numpy as np
 import pytest
@@ -24,7 +25,7 @@ from core.execution import (submit_and_track, close_strategy_position, broker_po
 from core.logger import get_trades_full
 from metrics.risk_manager import (get_atr_adjusted_thresholds, risk_level_from_drawdown,
                                   portfolio_atr_fraction, atr_as_fraction)
-from strategies.common import Decision, run_cycle, evaluate_risk, trade_ticker
+from strategies.common import Decision, run_cycle, evaluate_risk, trade_ticker, utcnow
 from tests.conftest import make_featured_df
 from tests.fakes import FakeAlpaca, FakeAPIError
 from tests.test_engine import make_ctx, always
@@ -309,7 +310,7 @@ def test_t06_repeated_stale_bar_uses_the_broker_quote(db_path):
     api = FakeAlpaca(prices={"SPY": 500.0})
     _held_stable(db_path, api)
     api.set_price("SPY", 400.0)                                   # reality fell 20%
-    stale = make_featured_df(price=500.0, start="2026-06-01")     # bar weeks old, still says 500
+    stale = make_featured_df(price=500.0, end_offset_days=30)     # bar weeks old, still says 500
     ctx = make_ctx("stable", api, {"SPY": stale}, decide=always("BUY"), db_path=db_path)
     out = run_cycle(ctx, api, **FAST)
     r = out["risk"]
@@ -366,7 +367,7 @@ def test_t07_position_dependent_decider_cannot_oscillate_within_a_bar(db_path):
     def ppo_like(ctx, ticker, df, owned_qty, avg, price):
         return Decision("SELL" if owned_qty > 0 else "BUY", None, "ppo")
     api = FakeAlpaca(prices={"BTCUSD": 60000.0})
-    frames = {"X:BTCUSD": make_featured_df(price=60000.0, start="2026-08-01")}
+    frames = {"X:BTCUSD": make_featured_df(price=60000.0, end_offset_days=1)}
     ctx = make_ctx("risky2", api, frames, decide=ppo_like, db_path=db_path)
     outs = [run_cycle(ctx, api, **FAST)["tickers"]["X:BTCUSD"] for _ in range(6)]
     assert outs[0] == "buy-filled" and all(o == "hold-deferred" for o in outs[1:])
@@ -374,8 +375,9 @@ def test_t07_position_dependent_decider_cannot_oscillate_within_a_bar(db_path):
     # a new bar allows the exit (min hold is enforced separately; simulate it elapsed)
     from core.logger import db_connection
     with db_connection(db_path) as conn:
-        conn.execute("UPDATE positions SET opened_at = '2026-01-01T00:00:00' WHERE strategy = 'risky2'")
-    frames["X:BTCUSD"] = make_featured_df(price=60000.0, start="2026-08-02")
+        held_since = (utcnow() - timedelta(days=1)).replace(tzinfo=None).isoformat()
+        conn.execute("UPDATE positions SET opened_at = ? WHERE strategy = 'risky2'", (held_since,))
+    frames["X:BTCUSD"] = make_featured_df(price=60000.0, end_offset_days=0)
     assert run_cycle(ctx, api, **FAST)["tickers"]["X:BTCUSD"] == "sell-filled"
     assert run_cycle(ctx, api, **FAST)["tickers"]["X:BTCUSD"] == "entry-anti-churn"   # no re-entry on the exit bar
     assert len(api.submitted) == 2

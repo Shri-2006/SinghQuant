@@ -64,9 +64,9 @@ def test_no_entry_when_momentum_exit_condition_already_true(db_path):
 def test_oscillation_sequence_collapses_to_one_round_trip(db_path):
     """Four cycles that used to produce BUY,SELL,BUY,SELL now produce at most one BUY and one SELL."""
     api = FakeAlpaca(prices={"TSLA": 345.82})
-    bar_a_up = make_featured_df(price=345.82, momentum_5=+0.02, start="2026-08-01")
-    bar_a_dn = make_featured_df(price=345.82, momentum_5=-0.02, start="2026-08-01")   # same bar id
-    bar_b_dn = make_featured_df(price=345.82, momentum_5=-0.02, start="2026-08-02")   # next bar
+    bar_a_up = make_featured_df(price=345.82, momentum_5=+0.02, end_offset_days=1)
+    bar_a_dn = make_featured_df(price=345.82, momentum_5=-0.02, end_offset_days=1)   # same bar id
+    bar_b_dn = make_featured_df(price=345.82, momentum_5=-0.02, end_offset_days=0)   # next bar
     frames = {"TSLA": bar_a_up}
     ctx = make_ctx("risky1", api, frames, decide=always("BUY"), db_path=db_path)
     r1 = run_cycle(ctx, api, **FAST)["tickers"]["TSLA"]          # buys on bar A

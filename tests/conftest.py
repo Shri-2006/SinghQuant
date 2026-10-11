@@ -31,9 +31,30 @@ def db_path(tmp_path):
     return p
 
 
-def make_featured_df(rows=60, price=500.0, momentum_5=0.01, atr=5.0, start="2026-08-01", nan_last=False):
-    """A featured DataFrame with every FEATURE_COLUMNS column; last close == price."""
-    idx = pd.date_range(start, periods=rows, freq="D")
+def fixture_today():
+    """Today's UTC midnight (naive), the anchor for every synthetic bar index."""
+    return pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+
+
+def make_featured_df(rows=60, price=500.0, momentum_5=0.01, atr=5.0, end_offset_days=0, nan_last=False, now=None):
+    """
+    A featured DataFrame with every FEATURE_COLUMNS column; last close == price.
+
+    Bars are daily and END `end_offset_days` before today (UTC), so fixtures
+    never age past STALE_BAR_MAX_DAYS as the calendar moves (the original
+    hard-coded start="2026-08-01" made the suite fail after 2026-10-04).
+    Two frames with different offsets have different bar ids; equal offsets
+    give the same bar id. Pass `now` to anchor the bars to a frozen clock.
+    """
+    if now is None:
+        anchor = fixture_today()
+    else:
+        anchor = pd.Timestamp(now)
+        if anchor.tzinfo is not None:
+            anchor = anchor.tz_convert("UTC").tz_localize(None)
+        anchor = anchor.normalize()
+    end = anchor - pd.Timedelta(days=end_offset_days)
+    idx = pd.date_range(end=end, periods=rows, freq="D")
     closes = np.linspace(price * 0.9, price, rows)
     df = pd.DataFrame({
         "open": closes * 0.999, "high": closes * 1.01, "low": closes * 0.99, "close": closes,

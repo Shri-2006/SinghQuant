@@ -2,7 +2,9 @@ name: Run Tests
 
 on:
   push:
-    branches: [main]
+    # Every branch, so work branches (audit-hardening, claude-remediation, ...)
+    # are tested before they are proposed for main.
+    branches: ['**']
   pull_request:
     branches: [main]
 

@@ -203,12 +203,12 @@ def test_s06_dust_remainder_is_not_resubmitted_every_cycle(db_path):
 
 def test_s07_rejected_entry_is_not_retried_on_the_same_bar(db_path):
     api = FakeAlpaca(prices={"SPY": 500.0}, fill_mode="reject")
-    frames = {"SPY": make_featured_df(price=500.0, start="2026-08-01")}
+    frames = {"SPY": make_featured_df(price=500.0, end_offset_days=1)}
     ctx = make_ctx("stable", api, frames, decide=always("BUY"), db_path=db_path)
     assert run_cycle(ctx, api, **FAST)["tickers"]["SPY"] == "buy-rejected"
     assert run_cycle(ctx, api, **FAST)["tickers"]["SPY"] == "entry-anti-churn"
     assert len(api.submitted) == 1
-    frames["SPY"] = make_featured_df(price=500.0, start="2026-08-02")   # new bar: try again
+    frames["SPY"] = make_featured_df(price=500.0, end_offset_days=0)   # new bar: try again
     api.fill_mode = "fill"
     assert run_cycle(ctx, api, **FAST)["tickers"]["SPY"] == "buy-filled"
 

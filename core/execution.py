@@ -42,8 +42,13 @@ from core import portfolio
 from core.config import ORDER_FILL_TIMEOUT_SECONDS
 from core.logger import log_trade
 
-TERMINAL_STATUSES = {"filled", "canceled", "cancelled", "expired", "rejected", "done_for_day",
-                     "replaced", "stopped", "suspended", "unknown_at_broker", "reconcile_error"}
+# Single source of truth for final order states (remediation R-4): everything
+# else, including broker states this code has never seen, is treated as open.
+TERMINAL_STATUSES = set(portfolio.TERMINAL_ORDER_STATUSES)
+# An order the broker never acknowledged (no broker id) is only declared
+# unknown_at_broker once a not-found answer persists past this grace period;
+# right after an ambiguous submission a lookup can miss an order in flight.
+UNKNOWN_ORDER_GRACE_MINUTES = 10
 MIN_SELL_NOTIONAL = 1.0          # Alpaca will not accept a fractional order below $1
 UNRESOLVED_ORDER_MAX_AGE_HOURS = 48   # an order we cannot refresh for this long stops blocking
 ALPACA_POSITION_NOT_FOUND_CODE = 40410000
@@ -107,6 +112,22 @@ def _exc_alpaca_code(exc):
     except Exception:
         return None
     return code if isinstance(code, int) else None
+
+
+def _is_definitive_rejection(exc):
+    """
+    True only when the broker AUTHORITATIVELY refused a submission (remediation
+    R-4): an HTTP 4xx (or Alpaca 8-digit 4xx code) other than 408 timeout,
+    409 conflict (e.g. the client order id already exists) and 429 rate limit.
+    Timeouts, connection errors, 5xx and unreadable errors are ambiguous: the
+    broker may have accepted the order.
+    """
+    code = _exc_status_code(exc)
+    if code is None:
+        ac = _exc_alpaca_code(exc)
+        if ac is not None and 10_000_000 <= ac < 100_000_000:
+            code = ac // 100_000
+    return code is not None and 400 <= code < 500 and code not in (408, 409, 429)
 
 
 def _is_not_found(exc):
@@ -274,6 +295,12 @@ def reconcile_open_orders(api, strategy, db_path=None):
         border, err = _fetch_broker_order(api, o)
         if border is None:
             if err is not None and _is_not_found(err):
+                if not o.get("broker_order_id") and _age_hours(o.get("submitted_at")) * 60 < UNKNOWN_ORDER_GRACE_MINUTES:
+                    # Never acknowledged and only just submitted: a miss is not yet proof (R-4).
+                    still_open.append({**o, "status": "unresolved"})
+                    portfolio.update_order(o["id"], "unresolved", db_path=db_path)
+                    print(f"[execution] {strategy} order {o['id']} not found yet; keeping it open (grace period)")
+                    continue
                 # The broker has no record of it (e.g. paper account reset): it cannot fill.
                 print(f"[execution] {strategy} order {o['id']} unknown at broker; closing it locally")
                 portfolio.update_order(o["id"], "unknown_at_broker", db_path=db_path)
@@ -414,19 +441,33 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
                                  time_in_force=time_in_force, client_order_id=client_order_id)
     except Exception as e:
         # The broker may have accepted the order even though we saw an exception
-        # (network timeout after processing). Check by client id before calling it rejected.
-        order = None
+        # (network timeout after processing). Check by client id first.
+        order, lookup_err = None, None
         try:
             order = api.get_order_by_client_order_id(client_order_id)
-        except Exception:
-            order = None
+        except Exception as le:
+            lookup_err = le
         if order is None:
-            portfolio.update_order(row_id, "rejected", db_path=db_path)
+            if _is_definitive_rejection(e):
+                portfolio.update_order(row_id, "rejected", db_path=db_path)
+                log_trade(strategy, symbol, side.upper(), signal_price, qty, pnl=None, reason=reason,
+                          signal_price=signal_price, status="rejected", filled_qty=0.0,
+                          strategy_position_before=owned_qty, account_position_before=account_qty_before,
+                          risk_state=risk_state, model_output=model_output, db_path=db_path)
+                return OrderResult(strategy, symbol, side, qty, "rejected", message=f"broker rejected: {e}")
+            # Ambiguous (remediation R-4): no authoritative evidence the order failed. Keep
+            # it OPEN so reconcile_open_orders looks it up by client id every cycle; it keeps
+            # blocking a duplicate order for the symbol and keeps its budget reservation.
+            portfolio.update_order(row_id, "unresolved", db_path=db_path)
             log_trade(strategy, symbol, side.upper(), signal_price, qty, pnl=None, reason=reason,
-                      signal_price=signal_price, status="rejected", filled_qty=0.0,
+                      signal_price=signal_price, status="unresolved", filled_qty=None,
                       strategy_position_before=owned_qty, account_position_before=account_qty_before,
                       risk_state=risk_state, model_output=model_output, db_path=db_path)
-            return OrderResult(strategy, symbol, side, qty, "rejected", message=f"broker rejected: {e}")
+            print(f"[execution] {strategy} {side} {qty} {symbol}: submission outcome unknown ({e}; "
+                  f"client-id lookup: {lookup_err}); kept open for reconciliation")
+            return OrderResult(strategy, symbol, side, qty, "unresolved",
+                               message=f"submission outcome unknown ({e}); will be reconciled by client id "
+                                       f"{client_order_id}")
         print(f"[execution] submit raised ({e}) but the broker has the order; continuing with it")
 
     order_id = str(_attr(order, "id", ""))
@@ -450,7 +491,10 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
             realized = None
     else:
         # Nothing booked: keep filled_qty at 0 so a later reconcile books it when a price exists.
-        portfolio.update_order(row_id, status, filled_avg_price=filled_avg_price, db_path=db_path)
+        # A fill without a price must stay OPEN locally ("awaiting_fill_price"), exactly as in
+        # _apply_order_state; storing the broker's terminal "filled" here lost it (R-4).
+        local_status = "awaiting_fill_price" if filled_qty > 0 else status
+        portfolio.update_order(row_id, local_status, filled_avg_price=filled_avg_price, db_path=db_path)
 
     log_trade(strategy, symbol, side.upper(), signal_price, qty, pnl=realized, reason=reason,
               signal_price=signal_price, order_id=order_id, status=status,
@@ -458,7 +502,10 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
               strategy_position_before=owned_qty, account_position_before=account_qty_before,
               risk_state=risk_state, model_output=model_output, db_path=db_path)
 
-    if status == "rejected":
+    if filled_qty > 0 and booked_qty <= 0:
+        status = "awaiting_fill_price"
+        msg = "broker reports a fill without a price; it will be booked when reconciled"
+    elif status == "rejected":
         msg = "broker rejected the order"
     elif status in TERMINAL_STATUSES and filled_qty <= 0:
         msg = f"order ended {status} with no fill"

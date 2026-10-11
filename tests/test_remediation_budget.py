@@ -11,6 +11,7 @@ The engine sizes inside `available`; execution re-checks it and records the
 reserving order row in one BEGIN IMMEDIATE transaction (thread- and
 process-safe). Risk thresholds and MAX_POSITION_SIZE are unchanged.
 """
+import itertools
 import os
 import subprocess
 import sys
@@ -26,7 +27,9 @@ from tests.conftest import make_featured_df
 from tests.fakes import FakeAlpaca
 from tests.test_engine import make_ctx, always
 
-FAST = dict(sleep_fn=lambda s: None)
+_clock = itertools.count(0, 30)    # fake monotonic clock: a pending order times out after one poll
+FAST = dict(sleep_fn=lambda s: None)                                   # run_cycle
+EXEC = dict(sleep_fn=lambda s: None, clock_fn=lambda: next(_clock))  # direct execution calls
 STABLE8 = ["SPY", "QQQ", "AAPL", "MSFT", "DIA", "IWM", "SAP", "AMZN"]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -87,10 +90,10 @@ def test_rounding_never_exceeds_the_budget(db_path):
 
 def test_open_buy_order_reserves_budget_until_it_fills_or_ends(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0, "QQQ": 100.0}, fill_mode="pending")
-    res = submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **FAST)
+    res = submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **EXEC)
     assert res.status == "new"
     assert portfolio.available_budget("stable", db_path) == pytest.approx(800.0)
-    refused = submit_and_track(api, "stable", "QQQ", "buy", 8.5, 100.0, "x", db_path=db_path, **FAST)
+    refused = submit_and_track(api, "stable", "QQQ", "buy", 8.5, 100.0, "x", db_path=db_path, **EXEC)
     assert refused.status == "refused" and "budget" in refused.message
     assert [o["symbol"] for o in api.submitted] == ["SPY"]                     # never reached the broker
     api.fill_pending(res.order_id, fraction=0.5)                               # partial fill: cash moves, reservation shrinks
@@ -104,7 +107,7 @@ def test_open_buy_order_reserves_budget_until_it_fills_or_ends(db_path):
 
 def test_over_budget_submit_writes_nothing(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    res = submit_and_track(api, "stable", "SPY", "buy", 10.5, 100.0, "x", db_path=db_path, **FAST)
+    res = submit_and_track(api, "stable", "SPY", "buy", 10.5, 100.0, "x", db_path=db_path, **EXEC)
     assert res.status == "refused" and api.submitted == []
     assert portfolio.open_orders("stable", db_path=db_path) == []
     assert portfolio.get_strategy_state("stable", db_path)["cash_budget"] == pytest.approx(1000.0)
@@ -112,9 +115,9 @@ def test_over_budget_submit_writes_nothing(db_path):
 
 def test_budgets_are_per_strategy(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0, "NVDA": 100.0})
-    assert submit_and_track(api, "stable", "SPY", "buy", 10.0, 100.0, "x", db_path=db_path, **FAST).status == "filled"
-    assert submit_and_track(api, "risky1", "NVDA", "buy", 2.0, 100.0, "x", db_path=db_path, **FAST).status == "filled"
-    assert submit_and_track(api, "risky1", "NVDA", "buy", 0.1, 100.0, "x", db_path=db_path, **FAST).status == "refused"
+    assert submit_and_track(api, "stable", "SPY", "buy", 10.0, 100.0, "x", db_path=db_path, **EXEC).status == "filled"
+    assert submit_and_track(api, "risky1", "NVDA", "buy", 2.0, 100.0, "x", db_path=db_path, **EXEC).status == "filled"
+    assert submit_and_track(api, "risky1", "NVDA", "buy", 0.1, 100.0, "x", db_path=db_path, **EXEC).status == "refused"
 
 
 # ---------------------------------------------------------------------------

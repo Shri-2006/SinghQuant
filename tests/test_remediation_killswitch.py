@@ -11,6 +11,7 @@ Owner decisions encoded here:
         blocked and nothing is liquidated because of an API outage.
 Risk thresholds are not changed by any of this.
 """
+import itertools
 import sqlite3
 
 import pytest
@@ -25,7 +26,9 @@ from tests.conftest import make_featured_df
 from tests.fakes import FakeAlpaca, FakeAPIError
 from tests.test_engine import make_ctx, always
 
-FAST = dict(sleep_fn=lambda s: None)
+_clock = itertools.count(0, 30)    # fake monotonic clock: a pending order times out after one poll
+FAST = dict(sleep_fn=lambda s: None)                                   # run_cycle
+EXEC = dict(sleep_fn=lambda s: None, clock_fn=lambda: next(_clock))  # direct execution calls
 
 
 class AlpacaCodeError(Exception):
@@ -39,7 +42,7 @@ class AlpacaCodeError(Exception):
 def _two_positions(db_path, api):
     """stable owns 4 SPY and 4 QQQ at $100 (cash budget left: $200)."""
     for sym in ("SPY", "QQQ"):
-        submit_and_track(api, "stable", sym, "buy", 4.0, 100.0, "x", db_path=db_path, **FAST)
+        submit_and_track(api, "stable", sym, "buy", 4.0, 100.0, "x", db_path=db_path, **EXEC)
 
 
 def _alerts(ctx):
@@ -127,7 +130,7 @@ def test_strategy_holding_only_vanished_positions_can_still_be_killed(db_path):
 def test_single_implausible_print_on_a_vanished_position_cannot_fake_a_kill(db_path):
     """No broker quote exists to check it, so a >50% one-step print is not trusted (T-06 rule kept)."""
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **EXEC)
     api.positions.clear()
     frames = {"SPY": make_featured_df(price=1.0)}               # bad tick: -99%
     ctx = make_ctx("stable", api, frames, db_path=db_path)
@@ -144,7 +147,7 @@ def test_single_implausible_print_on_a_vanished_position_cannot_fake_a_kill(db_p
 @pytest.mark.parametrize("mark, expected_px", [(150.0, 100.0), (70.0, 70.0)])
 def test_flagged_quantity_is_valued_at_min_of_mark_last_mark_and_cost(db_path, mark, expected_px):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **EXEC)
     cash = portfolio.get_strategy_state("stable", db_path)["cash_budget"]
     portfolio.flag_discrepancy("stable", "SPY", 4.0, "test", db_path=db_path)
     eq, value, _ = portfolio.strategy_equity("stable", {"SPY": mark}, db_path)
@@ -158,7 +161,7 @@ def test_flagged_quantity_is_valued_at_min_of_mark_last_mark_and_cost(db_path, m
 
 def test_partially_flagged_position_values_only_the_flagged_part_conservatively(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 4.0, 100.0, "x", db_path=db_path, **EXEC)
     portfolio.flag_discrepancy("stable", "SPY", 1.0, "test", db_path=db_path)
     _, value, _ = portfolio.strategy_equity("stable", {"SPY": 120.0}, db_path)
     assert value == pytest.approx(3.0 * 120.0 + 1.0 * 100.0)
@@ -185,7 +188,7 @@ def test_only_authoritative_answers_count_as_absent(exc, expected):
 
 def test_bare_404_never_flags_a_position(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     api.fail_get_position = FakeAPIError("404 Not Found", 404)
     ctx = make_ctx("stable", api, {"SPY": make_featured_df(price=100.0)}, db_path=db_path)
     refresh_discrepancies(ctx, api)
@@ -198,9 +201,9 @@ def test_bare_404_never_flags_a_position(db_path):
 
 def test_in_flight_sell_is_not_flagged_and_reconciles_cleanly(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     api.fill_mode = "pending"
-    res = submit_and_track(api, "stable", "SPY", "sell", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    res = submit_and_track(api, "stable", "SPY", "sell", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     api.fill_pending(res.order_id)                          # sold at the broker, not yet booked locally
     ctx = make_ctx("stable", api, {}, db_path=db_path)
     refresh_discrepancies(ctx, api)
@@ -211,7 +214,7 @@ def test_in_flight_sell_is_not_flagged_and_reconciles_cleanly(db_path):
 
 def test_flag_clears_itself_when_the_broker_holds_the_position_again(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     api.positions.clear()
     ctx = make_ctx("stable", api, {}, db_path=db_path)
     refresh_discrepancies(ctx, api)
@@ -225,8 +228,8 @@ def test_flag_clears_itself_when_the_broker_holds_the_position_again(db_path):
 
 def test_flagged_symbols_take_no_new_entries(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0, "QQQ": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 0.5, 100.0, "x", db_path=db_path, **FAST)
-    submit_and_track(api, "stable", "QQQ", "buy", 0.5, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 0.5, 100.0, "x", db_path=db_path, **EXEC)
+    submit_and_track(api, "stable", "QQQ", "buy", 0.5, 100.0, "x", db_path=db_path, **EXEC)
     api.positions["SPY"]["qty"] = 0.25                      # half of SPY vanished
     del api.positions["QQQ"]                                # all of QQQ vanished
     frames = {"SPY": make_featured_df(price=100.0), "QQQ": make_featured_df(price=100.0)}
@@ -240,10 +243,10 @@ def test_flagged_symbols_take_no_new_entries(db_path):
 
 def test_kill_switch_liquidates_the_unflagged_part_and_keeps_the_flag(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     api.positions["SPY"]["qty"] = 0.6
     portfolio.flag_discrepancy("stable", "SPY", 0.4, "test", db_path=db_path)
-    results = close_all_strategy_positions(api, "stable", {"SPY": 100.0}, "KILL", db_path=db_path, **FAST)
+    results = close_all_strategy_positions(api, "stable", {"SPY": 100.0}, "KILL", db_path=db_path, **EXEC)
     assert [(r.status, round(r.filled_qty, 6)) for r in results] == [("filled", 0.6)]
     assert portfolio.get_position_qty("stable", "SPY", db_path) == pytest.approx(0.4)
     assert portfolio.get_discrepancy_qty("stable", "SPY", db_path) == pytest.approx(0.4)
@@ -255,7 +258,7 @@ def test_kill_switch_liquidates_the_unflagged_part_and_keeps_the_flag(db_path):
 
 def test_persistent_suspect_state_alerts_blocks_entries_and_never_liquidates(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0, "QQQ": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     frames = {"QQQ": make_featured_df(price=100.0)}          # SPY's primary mark is missing ...
     ctx = make_ctx("stable", api, frames, decide=always("BUY"), db_path=db_path)
     ctx.assets = ["SPY", "QQQ"]
@@ -282,7 +285,7 @@ def test_persistent_suspect_state_alerts_blocks_entries_and_never_liquidates(db_
 
 def test_short_suspect_blip_does_not_alert(db_path):
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 1.0, 100.0, "x", db_path=db_path, **EXEC)
     frames = {}
     ctx = make_ctx("stable", api, frames, db_path=db_path)
     ctx.assets = ["SPY"]
@@ -303,7 +306,7 @@ def test_short_suspect_blip_does_not_alert(db_path):
 def test_reconcile_tool_is_dry_run_by_default_and_writes_off_only_with_confirm(db_path, capsys):
     from tools.reconcile_position import main
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **EXEC)
     portfolio.flag_discrepancy("stable", "SPY", 2.0, "test", db_path=db_path)
     assert main([], db_path=db_path) == 0 and "missing at broker 2.000000" in capsys.readouterr().out
     main(["write-off", "stable", "SPY", "--mark", "90", "--note", "checked broker"], db_path=db_path)
@@ -317,7 +320,7 @@ def test_reconcile_tool_is_dry_run_by_default_and_writes_off_only_with_confirm(d
 def test_reconcile_tool_clear_removes_only_the_flag(db_path):
     from tools.reconcile_position import main
     api = FakeAlpaca(cash=100000, prices={"SPY": 100.0})
-    submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **FAST)
+    submit_and_track(api, "stable", "SPY", "buy", 2.0, 100.0, "x", db_path=db_path, **EXEC)
     portfolio.flag_discrepancy("stable", "SPY", 2.0, "test", db_path=db_path)
     cash = portfolio.get_strategy_state("stable", db_path)["cash_budget"]
     main(["clear", "stable", "SPY", "--note", "broker shows 2 shares", "--confirm"], db_path=db_path)
@@ -360,7 +363,7 @@ def test_flagging_a_position_does_not_change_the_atr_adjusted_thresholds(db_path
         init_db(path)
         api = FakeAlpaca(cash=100000, prices={"SPY": 100.0, "QQQ": 100.0})
         for s in ("SPY", "QQQ"):
-            submit_and_track(api, "stable", s, "buy", 4.0, 100.0, "p", db_path=path, **FAST)
+            submit_and_track(api, "stable", s, "buy", 4.0, 100.0, "p", db_path=path, **EXEC)
         if vanish:
             del api.positions["QQQ"]
         frames = {"QQQ": make_featured_df(price=100.0, atr=1.0)}

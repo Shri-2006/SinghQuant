@@ -516,11 +516,19 @@ def set_signal_state(strategy, symbol, last_bar, last_action, db_path=None):
 # Orders (BROKER orders only; internal accounting never appears here)
 # ---------------------------------------------------------------------------
 
-# "submitting" is included: an order row in that state means the process may
-# have died between sending the order and recording the broker id, so it must
-# be reconciled (by client_order_id), never ignored (second-pass S-01).
-OPEN_ORDER_STATUSES = ("submitting", "new", "accepted", "pending_new", "partially_filled",
-                       "accepted_for_bidding", "pending", "held", "unresolved", "awaiting_fill_price")
+# Remediation R-4: an order is OPEN unless its status is known to be FINAL.
+# The old allow-list missed broker states such as pending_cancel,
+# pending_replace, calculated, done_for_day, stopped and suspended; a fill
+# arriving after them was never booked. Anything not listed here (including
+# "submitting", "unresolved" and "awaiting_fill_price", second-pass S-01) is
+# reconciled every cycle, keeps blocking duplicate orders for the symbol and
+# keeps reserving budget.
+TERMINAL_ORDER_STATUSES = ("filled", "canceled", "cancelled", "expired", "rejected", "replaced",
+                           "unknown_at_broker", "reconcile_error", "unresolved_stale")
+
+
+def is_open_status(status):
+    return str(status).lower() not in TERMINAL_ORDER_STATUSES
 
 
 def record_order(strategy, symbol, side, requested_qty, signal_price, status, broker_order_id=None,
@@ -550,11 +558,12 @@ BUDGET_TOLERANCE = 1e-6
 
 
 def _reserved_buy_notional(conn, strategy):
-    placeholders = ",".join("?" for _ in OPEN_ORDER_STATUSES)
+    placeholders = ",".join("?" for _ in TERMINAL_ORDER_STATUSES)
     row = conn.execute(f'''SELECT COALESCE(SUM(MAX(requested_qty - filled_qty, 0) *
                                            COALESCE(signal_price, filled_avg_price, 0)), 0)
-                            FROM orders WHERE strategy = ? AND side = 'buy' AND status IN ({placeholders})''',
-                       (strategy, *OPEN_ORDER_STATUSES)).fetchone()
+                            FROM orders WHERE strategy = ? AND side = 'buy'
+                              AND LOWER(status) NOT IN ({placeholders})''',
+                       (strategy, *TERMINAL_ORDER_STATUSES)).fetchone()
     return float(row[0] or 0.0)
 
 
@@ -608,15 +617,16 @@ def update_order(order_row_id, status, filled_qty=None, filled_avg_price=None, b
 
 def open_orders(strategy, symbol=None, db_path=None):
     """Orders this strategy submitted that are not yet in a terminal state."""
-    placeholders = ",".join("?" for _ in OPEN_ORDER_STATUSES)
+    placeholders = ",".join("?" for _ in TERMINAL_ORDER_STATUSES)
     cols = 'id, symbol, side, requested_qty, broker_order_id, status, filled_qty, client_order_id, submitted_at'
+    open_clause = f'LOWER(status) NOT IN ({placeholders})'
     with db_connection(db_path) as conn:
         if symbol is None:
-            rows = conn.execute(f'SELECT {cols} FROM orders WHERE strategy = ? AND status IN ({placeholders})',
-                                (strategy, *OPEN_ORDER_STATUSES)).fetchall()
+            rows = conn.execute(f'SELECT {cols} FROM orders WHERE strategy = ? AND {open_clause}',
+                                (strategy, *TERMINAL_ORDER_STATUSES)).fetchall()
         else:
-            rows = conn.execute(f'SELECT {cols} FROM orders WHERE strategy = ? AND symbol = ? AND status IN ({placeholders})',
-                                (strategy, symbol, *OPEN_ORDER_STATUSES)).fetchall()
+            rows = conn.execute(f'SELECT {cols} FROM orders WHERE strategy = ? AND symbol = ? AND {open_clause}',
+                                (strategy, symbol, *TERMINAL_ORDER_STATUSES)).fetchall()
     return [{"id": r[0], "symbol": r[1], "side": r[2], "requested_qty": r[3], "broker_order_id": r[4],
              "status": r[5], "filled_qty": r[6], "client_order_id": r[7], "submitted_at": r[8]} for r in rows]
 

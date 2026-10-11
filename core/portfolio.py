@@ -29,7 +29,7 @@ import math
 from datetime import datetime, timezone
 
 from core.config import CAPITAL
-from core.logger import db_connection, utc_now_iso
+from core.logger import db_connection, utc_now_iso, is_readonly
 
 EVENT_FILL = "FILL"
 EVENT_ADOPT = "ADOPT"
@@ -45,7 +45,9 @@ def _now():
 # ---------------------------------------------------------------------------
 
 def ensure_strategy_state(strategy, db_path=None):
-    """Creates the state row for a strategy on first use (cash = CAPITAL)."""
+    """Creates the state row for a strategy on first use (cash = CAPITAL). No-op when read-only."""
+    if is_readonly():
+        return
     with db_connection(db_path) as conn:
         row = conn.execute('SELECT strategy FROM strategy_state WHERE strategy = ?',
                            (strategy,)).fetchone()
@@ -62,6 +64,8 @@ def get_strategy_state(strategy, db_path=None):
         row = conn.execute('''SELECT cash_budget, peak_equity, last_equity, critical_streak, halted, halted_reason,
                                      suspect_streak
                               FROM strategy_state WHERE strategy = ?''', (strategy,)).fetchone()
+    if row is None:   # read-only reader before the strategy ever ran: report the configured start state
+        row = (CAPITAL[strategy], CAPITAL[strategy], CAPITAL[strategy], 0, 0, None, 0)
     return {
         "cash_budget": row[0], "peak_equity": row[1], "last_equity": row[2],
         "critical_streak": row[3], "halted": bool(row[4]), "halted_reason": row[5],

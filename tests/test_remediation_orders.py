@@ -10,6 +10,8 @@ makes a submission "rejected"; anything else is "unresolved" and is looked up
 by client order id every cycle.
 """
 import itertools
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from core import portfolio
@@ -157,8 +159,9 @@ def test_never_acknowledged_order_becomes_unknown_only_after_the_grace_period(db
     assert [o["status"] for o in reconcile_open_orders(api, "stable", db_path)] == ["unresolved"]
     assert portfolio.available_budget("stable", db_path) == pytest.approx(800.0)
     row_id = _order_row(db_path)[0]
-    with db_connection(db_path) as conn:                                          # 11 minutes later
-        conn.execute("UPDATE orders SET submitted_at = datetime('now', '-11 minutes') WHERE id = ?", (row_id,))
+    eleven_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=11)).replace(tzinfo=None).isoformat()
+    with db_connection(db_path) as conn:                                          # 11 minutes later (Python's clock,
+        conn.execute("UPDATE orders SET submitted_at = ? WHERE id = ?", (eleven_minutes_ago, row_id))  # like the code)
     assert reconcile_open_orders(api, "stable", db_path) == []
     assert _order_row(db_path)[1] == "unknown_at_broker"
     assert portfolio.available_budget("stable", db_path) == pytest.approx(1000.0)

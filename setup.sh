@@ -50,7 +50,12 @@ else
 fi
 
 python -m pip install "alpaca-trade-api==3.0.0" --no-deps
-python -m pip install msgpack websocket-client PyYAML deprecation aiohttp "websockets>=10"
+if [[ "$PINNED" == "1" ]]; then
+  # exact, verified versions (amd64 and arm64) for reproducible images
+  python -m pip install -r requirements-alpaca-runtime.txt
+else
+  python -m pip install msgpack websocket-client PyYAML deprecation aiohttp "websockets>=10"
+fi
 
 echo "Dependencies installed (pinned=$PINNED rl=$RL backtest=$BT dashboard=$DASH optional=$OPT)."
 echo "Next: create .env (see README), then run: python -m pytest tests/ -q"

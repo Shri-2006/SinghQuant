@@ -1,0 +1,15 @@
+# Packages alpaca-trade-api 3.0.0 actually imports. It is installed with
+# --no-deps because its declared pins (websockets<11, aiohttp==3.8.2, urllib3<2)
+# conflict with polygon-api-client and do not build on modern Python.
+#
+# Phase 2 I-5: exact pins for the Docker image / --pinned installs (they were
+# unpinned, so every build could resolve different versions). Each version was
+# checked on 2026-10-11 to resolve together with requirements-py311-pinned.txt
+# and to ship a linux/aarch64 cp311 (or pure-Python) wheel. websockets is the
+# version the pinned set resolves to; 17.x conflicts with it.
+aiohttp==3.14.5
+deprecation==2.1.0
+msgpack==1.2.3
+PyYAML==6.0.3
+websocket-client==1.9.2
+websockets==16.1.1

@@ -10,11 +10,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-24.04-arm is GitHub's native ARM64 (Ampere-class) runner, free for
+    # public repositories: the same CPU architecture as the Oracle Cloud host.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12']
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,6 +43,37 @@ jobs:
           POLYGON_API_KEY: test_key
           ALPACA_API_KEY: test_key
           ALPACA_SECRET_KEY: test_key
+
+  docker-image:
+    # Builds the production image natively on amd64 and arm64. The build itself
+    # runs tools/smoke_imports.py; the full test suite then runs INSIDE the image.
+    # Nothing is pushed anywhere and no credentials are used.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: |
+          touch .env
+          docker compose config --quiet
+
+      - name: Build image
+        run: docker build --tag singhquant:ci .
+
+      - name: Report platform and versions
+        run: docker run --rm singhquant:ci sh -c 'uname -m && python -m tools.smoke_imports --require-rl && pip freeze | grep -iE "^(torch|numpy|xgboost|pandas|websockets|aiohttp)=="'
+
+      - name: Run the test suite inside the image
+        run: >
+          docker run --rm --network none
+          -e POLYGON_API_KEY=test_key -e ALPACA_API_KEY=test_key -e ALPACA_SECRET_KEY=test_key
+          singhquant:ci python -m pytest tests/ -q -p no:cacheprovider
+          --deselect tests/test_regime.py::TestVIXSignal::test_get_vix_returns_float_or_none
 
 # Dummy keys: tests never call external APIs. The one network-dependent test
 # (live VIX fetch from FRED) is deselected so CI cannot fail on connectivity.

@@ -15,6 +15,12 @@ os.environ.pop("SINGHQUANT_ALLOW_LIVE_TRADING", None)
 os.environ.pop("SINGHQUANT_ADOPT_BROKER_POSITIONS", None)
 _TMP_DB_DIR = tempfile.mkdtemp(prefix="singhquant-tests-")
 os.environ["SINGHQUANT_DB_PATH"] = os.path.join(_TMP_DB_DIR, "trades_test.db")
+# Phase 2: never touch real model artifacts (the image sets /app/model_artifacts),
+# and never inherit the dashboard's read-only or a tool's no-migrate flag.
+os.environ["SINGHQUANT_MODEL_DIR"] = os.path.join(_TMP_DB_DIR, "model_artifacts")
+os.makedirs(os.environ["SINGHQUANT_MODEL_DIR"], exist_ok=True)
+os.environ.pop("SINGHQUANT_DB_READONLY", None)
+os.environ.pop("SINGHQUANT_NO_AUTO_MIGRATE", None)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402

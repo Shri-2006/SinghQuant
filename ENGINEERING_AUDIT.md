@@ -796,6 +796,55 @@ adopts.
 
 ---
 
+## 14. Phase 2 infrastructure (branch `claude-infrastructure`, 2026-10-11)
+
+Approved decisions: D1-A (missing models block entries; separate liveness,
+readiness and degraded reporting), D2-A (watchdog restart with persistent
+crash-loop detection and safe startup reconciliation), D3-A (one-shot migration
+service, transactional migrations, read-only dashboard), D4 (the repository is
+public, so CI uses native `ubuntu-24.04-arm` runners), D5 (log rotation,
+`./data` and `./model_artifacts`, root user kept, `xgboost` unchanged).
+**Trading logic, budgets and risk thresholds are unchanged.** Every new gate
+blocks only NEW entries. Validation used fake brokers and temporary databases
+only; nothing was deployed and no image was built in the sandbox (no Docker
+daemon). The image is built and tested by CI on amd64 and arm64.
+
+| ID | Problem | Change | Evidence |
+|---|---|---|---|
+| I-1 | Single-file DB mount left `-wal`/`-shm` in each container; un-checkpointed commits lost on recreate | `./data` directory volume for every service; `core/storage.py` explicit errors (directory created by Docker, missing or unwritable directory, failed `quick_check`); `tools/db_maintenance.py` (`migrate`, `check`, `checkpoint`, `backup` via the backup API, `cutover-import` from copies); runbook `docs/DEPLOYMENT.md` | `test_infra_storage.py` (12): a writer killed without closing shows the old layout loses commits and `cutover-import` recovers all of them |
+| I-2 | Bot and dashboard migrating at once: 34 crashes in 80 starts | One `BEGIN IMMEDIATE` transaction plus a `user_version` stamp; fast path takes no lock; `SchemaTooNew`; WAL switch retried (SQLite fails it without the busy handler); one-shot `migrate` service; dashboard `SINGHQUANT_DB_READONLY=1` | `test_infra_migrations.py` (16); race probe: 40 failures in 80 starts before, 0 in 200 after; the 4-process test fails 9/10 trials without the WAL retry |
+| I-3 | Models not persisted; a missing model meant silent no-trading | `SINGHQUANT_MODEL_DIR` volume; `models/artifacts.py` content-addressed atomic publish and `manifest.json` (file, SHA-256, version, metadata, previous entry); hash verified before unpickling; status reported in the heartbeat; alerts every 6 h and on recovery; `tools/model_manifest.py` | `test_infra_models.py` (18): tampered file never unpickled; reader never sees a broken artifact during 15 concurrent publishes |
+| I-4 | No SIGTERM handling (SIGKILL after 10 s); heartbeat stale for up to 48 h while paused; no health checks; thread death unnoticed; unlimited restarts | SIGTERM handler plus `init: true`; interruptible, chunked sleeps; `tools/healthcheck.py` (liveness vs readiness vs report); watchdog distinguishes dead or hung (restart) from degraded (keep running); `core/lifecycle.py` crash-loop accounting and persistent SAFE MODE; restart budget; startup reconciliation gate; reconcile before adopt | `test_infra_lifecycle.py` (25), including a real-process SIGTERM test and its control; `test_infra_compose.py` (11) |
+| I-5 | ARM64 unverified; post-alpaca packages unpinned | Closure check (all 130 packages available for aarch64 cp311); `requirements-alpaca-runtime.txt` exact pins; `python:3.11-slim-bookworm`; `PIP_NO_CACHE_DIR`; `tools/smoke_imports.py` as a build step; native arm64 CI (tests and image); `docs/ARM64_VALIDATION.md` | resolver dry run, smoke test on 3.11 / 3.13 |
+
+**Remaining risks after Phase 2**
+- The image has not been built by the authors. The CPU torch wheel for
+  aarch64 (download.pytorch.org was blocked in the sandbox) and the image as
+  a whole are validated only by the CI arm64 jobs, and on the host per
+  `docs/ARM64_VALIDATION.md`.
+- The cutover runbook has not been rehearsed on the real host. Rehearse it
+  on a copy (staging directory) first.
+- The ledger starts empty: positions held by the old bots are unmanaged
+  unless they are closed beforehand or adopted on the first start
+  (runbook step 0/7).
+- Existing production models have no manifest. Until they are registered
+  (runbook step 6) the bots are alive but open no positions, with alerts.
+- Plain Docker does not restart an *unhealthy* container. Restarts happen
+  only when run.py exits (watchdog / fatal startup). A hung main thread
+  would be visible as unhealthy but not restarted automatically.
+- A fatal storage or schema error keeps restarting every 5 minutes or so (no
+  trading, alerts each time) until fixed. It cannot be counted toward SAFE
+  MODE because the database is the thing that is broken.
+- Two bot processes on the same database (e.g. a manual `python run.py`
+  beside the container) are not prevented. Each counts the other's run as
+  unclean, and budgets stay atomic.
+- Still open from the Phase 1 review: H-3 kill-switch tightness sign-off,
+  H-4 reset-tool default, M-4 kill switch does not cancel open orders, M-5
+  late-fill P&L missing from `trades`, M-7 retrain promotion gate (now with
+  versioned artifacts and a manifest to build it on).
+
+---
+
 ## Appendix A: analysis scripts used on the export
 
 ```python

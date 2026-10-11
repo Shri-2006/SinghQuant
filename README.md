@@ -139,11 +139,18 @@ python -m pytest tests/ -q
 python run.py
 streamlit run dashboard/streamlit_app_v2.py
 ```
-or with Docker: `docker compose up` (bots + dashboard on port 8501, sharing `trades.db`).
+or with Docker: `docker compose up -d`. A one-shot `migrate` service runs first; the bots and the read-only dashboard (port 8501) start only if it succeeds. The database and its `-wal`/`-shm` files live together in `./data/`, and model artifacts in `./model_artifacts/` (bots only). **A host that ran the old layout (`./trades.db` mounted as a single file) must follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) first**: the old container holds un-checkpointed commits.
+
+Operations (Phase 2):
+- `python -m tools.healthcheck report|liveness|readiness`: liveness (heartbeat fresh) is what Docker checks; readiness (may open new entries) and degraded reasons are reported separately.
+- `python -m tools.model_manifest status|register`: a strategy opens new positions only while every model it needs is in `manifest.json` with a matching SHA-256. Missing or invalid models block entries, raise an alert every 6 h, and leave existing-position risk management running.
+- `python -m tools.db_maintenance check|backup|checkpoint|migrate`: read-only checks and online backups through SQLite's backup API.
+- `python -m tools.safe_mode status|clear`: 3 unclean exits within an hour put the system in persistent SAFE MODE (no new entries) until a human clears it.
+- ARM64 / Oracle Ampere: see [docs/ARM64_VALIDATION.md](docs/ARM64_VALIDATION.md). CI builds and tests the image natively on arm64.
 
 ## Migrating an existing `trades.db`
 
-The schema migration is additive: old rows are untouched, new columns and tables are added on first start. SELL rows written before the audit stored the position's **dollar market value** in the `quantity` column (recognisable by `status IS NULL`); rows written after store shares. If the broker already holds positions when the ledger is empty, the bot reports them and leaves them alone; set `SINGHQUANT_ADOPT_BROKER_POSITIONS=1` for one start to assign them to the strategy whose universe contains the symbol.
+The schema migration is additive, versioned (`PRAGMA user_version`) and runs in one transaction: old rows are untouched, new columns and tables are added on first start. SELL rows written before the audit stored the position's **dollar market value** in the `quantity` column (recognisable by `status IS NULL`); rows written after store shares. If the broker already holds positions when the ledger is empty, the bot reports them and leaves them alone; set `SINGHQUANT_ADOPT_BROKER_POSITIONS=1` for one start to assign them to the strategy whose universe contains the symbol.
 
 ## Audit evidence
 

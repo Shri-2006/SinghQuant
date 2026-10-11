@@ -744,6 +744,58 @@ pip --dry-run: requirements-core.txt + requirements-dev.txt and requirements-rl.
 
 **Readiness statement.** The branch is ready for the next stage, controlled Linux integration testing against `FakeAlpaca` and then Alpaca paper, with the specific items above as the checklist for that stage. It is not ready for unattended paper trading and is not evaluated for live trading.
 
+## 13. Phase 1 remediation (branch `claude-remediation`, 2026-10-11)
+
+An independent review of `audit-hardening` (2026-10-11) found that the
+branch's own test suite had started failing, plus four defects in the new
+code. The owner approved the fixes below, including decisions D1-B
+(flag vanished positions, never write them off automatically), D2 (suspect
+states alert only, never liquidate) and D4 (strict "absent"
+classification, expanded open statuses, CI on every branch). **No risk
+threshold, position size or strategy signal was changed.** Everything was
+validated against `tests/fakes.FakeAlpaca` and temporary SQLite files only.
+
+| ID | Problem | Fix | Tests |
+|---|---|---|---|
+| R-1 | Kill switch permanently disabled when a held symbol vanished at the broker during critical drawdown: every reading "suspect", no alert | Broker answers are classified ok/absent/unknown. "Absent" needs Alpaca code 40410000 or "position does not exist"; a bare 404 is unknown. An absent quantity is **flagged** on the position row (ledger, cost, cash and ownership preserved), valued at min(mark, last mark, entry) with a ratchet-down reference, excluded from claims on account shares, and no longer blocks corroboration. Flagged positions stay in the ATR weighting, so thresholds do not move. `suspect_streak` gives alerts after 3 and every 12 suspect cycles plus a recovery alert, and the heartbeat reads `SUSPECT`. The engine never writes off; `tools/reconcile_position.py` does, on `--confirm` only | `test_remediation_killswitch.py` (26) |
+| R-2 | Fixture bars hard-coded to 2026-08 aged past `STALE_BAR_MAX_DAYS`, so 16 tests failed from 2026-10-04 | Bars are anchored to today or an injected frozen clock. A guard test rejects literal fixture start dates. CI runs on every branch | `test_remediation_dates.py` (4); suite verified with the clock shifted 0, ±365 and +1825 days |
+| R-3 | Sizing ignored the strategy budget (stable could deploy $1,600 of $1,000); risky2's account-cash guard from `main` was dropped | available = cash budget − open buy reservations. The engine sizes inside it, and execution re-checks and reserves in one `BEGIN IMMEDIATE` transaction. risky2's account-cash guard is restored (fails closed). Slippage overdraft blocks buys and alerts once | `test_remediation_budget.py` (12, incl. thread and 4-process races) |
+| R-4 | Submit exception plus a failed client-id lookup was recorded as "rejected" although the broker filled it | Only an authoritative 4xx (not 408/409/429) is "rejected"; everything else is "unresolved" (open, reconciled by client id, blocks duplicates, keeps its reservation). Never-acknowledged orders get a 10-minute not-found grace period. Open means "not terminal"; `done_for_day`, `stopped` and `suspended` are now open. A fill without a price stays `awaiting_fill_price` | `test_remediation_orders.py` (31) |
+
+Changed existing tests (policy change, stated explicitly): the tests that
+asserted an **automatic** drift write-off (`test_execution.py`,
+`test_second_pass.py` S-03, `test_third_pass.py` T-01/T-05) now assert
+flag-and-preserve, and check the T-01/T-05 accounting guarantees through the
+manual write-off. Three ownership/sizing tests that bought beyond the $1,000
+budget now set an explicit budget. `test_s08` seeds the broker position it
+adopts.
+
+**Remaining risks after Phase 1**
+- A flagged position is valued conservatively but its shares are not at the
+  broker. If they were sold outside the system at a gain, the strategy budget
+  will not see the proceeds until someone reconciles. Removing an unrealized
+  gain from equity can itself move a strategy toward warning/critical.
+- A single implausible print (beyond the 50% step) on a flagged symbol is
+  ignored because no broker quote exists to check it. Genuine declines are
+  followed only in steps under 50% per cycle.
+- Crypto fees taken in kind leave a dust shortfall that is now flagged
+  instead of written off. Book fees at fill time before enabling risky2.
+- An unresolved order whose lookups keep failing blocks its symbol and
+  reserves budget for up to 48 h (`UNRESOLVED_ORDER_MAX_AGE_HOURS`). An
+  order the broker reports as `done_for_day`/`stopped`/`suspended` forever
+  keeps blocking its symbol.
+- Budget reservations are atomic per database file. Two processes on
+  *different* copies of the database (e.g. the WAL/bind-mount issue H-5)
+  are not protected.
+- Not addressed in Phase 1 (from the 2026-10-11 review): H-3 kill-switch
+  tightness sign-off, H-4 reset tool default, H-5 WAL bind mount, H-6
+  models missing from the image, M-1 migration race (the new additive
+  columns use the same unlocked migration), M-2 adopt-before-reconcile,
+  M-4 kill switch does not cancel open orders, M-5 late-fill P&L missing
+  from `trades`, M-7 retrain promotion gate, M-9 ARM64 image build.
+
+---
+
 ## Appendix A: analysis scripts used on the export
 
 ```python

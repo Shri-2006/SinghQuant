@@ -53,6 +53,8 @@ Key design points established by the audit:
 - **Strategy ownership.** Alpaca positions are account-wide, so the system keeps its own per-strategy ledger in SQLite. A strategy can only sell what its ledger says it owns; a kill switch closes only that strategy's positions; drawdown is measured on the strategy's own equity (cash budget + owned positions), not the shared account number.
 - **Units.** Order quantities are shares/coins everywhere. Dollar budgets are converted exactly once, at sizing. Every `trades` row logs the signal price, the requested quantity, the broker order id, the status, and the actual fill quantity and price.
 - **Kill switch.** Thresholds are the configured drawdowns scaled by the strategy's position-weighted ATR fraction, clamped to 0.5x to 1.5x, and static when no ATR is available. It fires only after two consecutive critical readings of a *validated* equity: a mark that moved more than 50% from the last accepted mark, or that comes from a bar older than five days, is checked against the broker's own quote; if they disagree the broker quote is used, and if no independent quote exists the symbol is marked suspect and nothing is done on it that cycle. Two identical bad bars therefore never confirm each other. A halted strategy stays halted across restarts until `python tools/reset_kill_switch.py <strategy>` is run.
+- **Ledger discrepancies (Phase 1 remediation).** If the broker no longer holds a quantity a strategy's ledger owns (paper reset, manual close), the missing quantity is *flagged*, never written off automatically. The ledger is preserved, the flagged quantity is valued at min(mark, last mark, entry), it can no longer block the kill switch, a Discord alert is sent, and new entries in that symbol are blocked. Resolve with `python tools/reconcile_position.py` (lists flags; `write-off ... --confirm` or `clear ... --confirm`). Unknown broker state (an outage) still makes the reading suspect, which blocks entries and never liquidates; an alert fires after 3 consecutive suspect cycles.
+- **Budgets.** Each strategy can only commit its own cash budget minus open buy orders; the check and the reservation are one atomic database transaction.
 - **Reconciliation is never a fill.** Inventory missing at the broker is written off through a distinct ledger event (`ledger_events.WRITE_OFF_DRIFT`) that credits cash at the lower of mark and cost, so an internal event can never raise equity or book a gain. Unsellable dust stays owned. An unknown broker state (timeout, 5xx, rate limit) is never read as "no position".
 - **Signal price vs fill price.** On Polygon's free tier the latest daily bar is the previous close; that is the *signal* price and is logged as such. Fill prices come from Alpaca and are logged separately.
 
@@ -71,7 +73,7 @@ data/         polygon_fetcher.py, sentiment_fetcher.py, macro_fetcher.py, discor
 paper_trading/alpaca_paper.py
 backtesting/  engine.py, run_backtest.py
 dashboard/    streamlit_app_v2.py (current), streamlit_app.py (legacy), compare.py
-tools/        reset_kill_switch.py
+tools/        reset_kill_switch.py, reconcile_position.py
 tests/        68 original unit tests + 56 regression tests (test_execution.py, test_engine.py, test_migration_and_startup.py, test_second_pass.py) with a fake broker (fakes.py)
 ```
 

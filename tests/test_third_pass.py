@@ -167,9 +167,10 @@ def test_t02_run_cycle_passes_atr_into_the_decision(db_path):
 
 def test_t02_strategy_level_warning_halves_size_even_if_ticker_atr_is_wide(db_path):
     api = FakeAlpaca(prices={"SPY": 500.0, "QQQ": 400.0})
-    portfolio.adopt_position("stable", "SPY", 2.0, 500.0, db_path)
+    # 1.7 SPY @ 500 leaves $150 of the $1,000 budget (R-3: a fully invested strategy cannot buy more)
+    portfolio.adopt_position("stable", "SPY", 1.7, 500.0, db_path)
     ctx = make_ctx("stable", api, {"QQQ": make_featured_df(price=400.0, atr=40.0)}, decide=always("BUY"), db_path=db_path)
-    risk = evaluate_risk(ctx, {"SPY": 460.0}, atr_fractions={"SPY": 0.015}, verify_mark=lambda s: 460.0)   # -8%: warning
+    risk = evaluate_risk(ctx, {"SPY": 450.0}, atr_fractions={"SPY": 0.015}, verify_mark=lambda s: 450.0)   # -8.5%: warning
     assert risk.level == "warning"
     out = trade_ticker(ctx, api, "QQQ", make_featured_df(price=400.0, atr=40.0), risk)   # QQQ ATR 10%: ticker says "safe"
     assert out == "buy-filled"

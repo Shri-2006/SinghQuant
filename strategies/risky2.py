@@ -52,6 +52,7 @@ def build_context(**overrides):
         momentum_exit=False,
         regime_gate=False,            # the original risky2 had no regime gate
         time_in_force="gtc",          # Alpaca crypto orders must be GTC
+        check_account_cash=True,      # crypto needs settled account cash (restored from main, R-3)
         notify=send_heartbeat,
         alert=send_alert,
     )

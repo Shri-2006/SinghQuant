@@ -397,8 +397,18 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
                                message=f"{qty} {symbol} is below the broker minimum notional; left in place")
 
     client_order_id = f"sq-{strategy}-{uuid.uuid4().hex[:20]}"
-    row_id = portfolio.record_order(strategy, symbol, side, qty, signal_price, "submitting", reason=reason,
-                                    client_order_id=client_order_id, db_path=db_path)
+    if side == "buy":
+        # Strict per-strategy budget (remediation R-3): the check and the reservation
+        # (this order row) are one atomic transaction.
+        row_id, available = portfolio.reserve_buy_order(strategy, symbol, qty, signal_price, reason=reason,
+                                                        client_order_id=client_order_id, db_path=db_path)
+        if row_id is None:
+            return OrderResult(strategy, symbol, side, qty, "refused",
+                               message=f"insufficient strategy budget: order ~${qty * (signal_price or 0):.2f} "
+                                       f"exceeds available ${available:.2f}")
+    else:
+        row_id = portfolio.record_order(strategy, symbol, side, qty, signal_price, "submitting", reason=reason,
+                                        client_order_id=client_order_id, db_path=db_path)
     try:
         order = api.submit_order(symbol=broker_symbol, qty=qty, side=side, type="market",
                                  time_in_force=time_in_force, client_order_id=client_order_id)

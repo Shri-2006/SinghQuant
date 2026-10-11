@@ -535,6 +535,66 @@ def record_order(strategy, symbol, side, requested_qty, signal_price, status, br
         return cur.lastrowid
 
 
+# ---------------------------------------------------------------------------
+# Strategy budget (remediation R-3)
+#
+# A strategy may only commit cash its own budget still has:
+#     available = cash_budget - notional of this strategy's OPEN buy orders
+# (unfilled quantity x signal price). The check and the order row that
+# reserves the cash are written in ONE `BEGIN IMMEDIATE` transaction, so two
+# threads or two processes on the same database cannot both pass the check
+# against the same dollars.
+# ---------------------------------------------------------------------------
+
+BUDGET_TOLERANCE = 1e-6
+
+
+def _reserved_buy_notional(conn, strategy):
+    placeholders = ",".join("?" for _ in OPEN_ORDER_STATUSES)
+    row = conn.execute(f'''SELECT COALESCE(SUM(MAX(requested_qty - filled_qty, 0) *
+                                           COALESCE(signal_price, filled_avg_price, 0)), 0)
+                            FROM orders WHERE strategy = ? AND side = 'buy' AND status IN ({placeholders})''',
+                       (strategy, *OPEN_ORDER_STATUSES)).fetchone()
+    return float(row[0] or 0.0)
+
+
+def available_budget(strategy, db_path=None):
+    """Cash this strategy may still commit: cash_budget minus open buy reservations."""
+    ensure_strategy_state(strategy, db_path)
+    with db_connection(db_path) as conn:
+        cash = conn.execute('SELECT cash_budget FROM strategy_state WHERE strategy = ?', (strategy,)).fetchone()[0]
+        return float(cash) - _reserved_buy_notional(conn, strategy)
+
+
+def reserve_buy_order(strategy, symbol, qty, signal_price, reason=None, client_order_id=None, db_path=None):
+    """
+    Atomically checks the budget and records a "submitting" buy order that
+    reserves qty x signal_price. Returns (order_row_id, available_before);
+    order_row_id is None when the budget is insufficient (nothing written).
+    """
+    ensure_strategy_state(strategy, db_path)
+    qty = float(qty)
+    try:
+        price = float(signal_price)
+    except (TypeError, ValueError):
+        return None, 0.0
+    if not (math.isfinite(price) and price > 0 and math.isfinite(qty) and qty > 0):
+        return None, 0.0
+    now = utc_now_iso()
+    with db_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cash = conn.execute('SELECT cash_budget FROM strategy_state WHERE strategy = ?', (strategy,)).fetchone()[0]
+        available = float(cash) - _reserved_buy_notional(conn, strategy)
+        if qty * price > available + BUDGET_TOLERANCE:
+            return None, available
+        cur = conn.execute('''INSERT INTO orders (strategy, symbol, side, requested_qty, signal_price, broker_order_id,
+                                                  status, filled_qty, filled_avg_price, reason, submitted_at, updated_at,
+                                                  client_order_id)
+                              VALUES (?,?,?,?,?,NULL,'submitting',0,NULL,?,?,?,?)''',
+                           (strategy, symbol, "buy", qty, price, reason, now, now, client_order_id))
+        return cur.lastrowid, available
+
+
 def update_order(order_row_id, status, filled_qty=None, filled_avg_price=None, broker_order_id=None, db_path=None):
     with db_connection(db_path) as conn:
         conn.execute('''UPDATE orders SET status = ?,

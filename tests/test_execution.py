@@ -75,7 +75,9 @@ def test_strategy_cannot_sell_more_than_it_owns(db_path):
 
 def test_one_strategy_cannot_liquidate_anothers_position(db_path):
     """Investigation 3 scenario: stable owns ~50 TSLA, risky1 owns 0.1446, risky1 sells."""
-    api = FakeAlpaca(prices={"TSLA": 345.82})
+    api = FakeAlpaca(cash=100000, prices={"TSLA": 345.82})
+    # R-3: budgets are enforced; this ownership scenario needs a ~$17k stable book
+    portfolio.update_strategy_state("stable", db_path, cash_budget=20000.0, peak_equity=20000.0, last_equity=20000.0)
     submit_and_track(api, "stable", "TSLA", "buy", 50.0, 345.82, "x", db_path=db_path, **FAST)
     submit_and_track(api, "risky1", "TSLA", "buy", 0.1446, 345.82, "x", db_path=db_path, **FAST)
     assert api.positions["TSLA"]["qty"] == pytest.approx(50.1446)

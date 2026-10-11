@@ -84,7 +84,9 @@ def test_s02_polygon_spacing_is_kept_between_fetches(db_path):
 # S-03 ----------------------------------------------------------------------
 
 def test_s03_account_short_of_sum_of_ledgers_never_sells_another_strategys_shares(db_path):
-    api = FakeAlpaca(prices={"TSLA": 345.82})
+    api = FakeAlpaca(cash=100000, prices={"TSLA": 345.82})
+    # R-3: budgets are enforced; this ownership scenario needs a ~$17k stable book
+    portfolio.update_strategy_state("stable", db_path, cash_budget=20000.0, peak_equity=20000.0, last_equity=20000.0)
     submit_and_track(api, "stable", "TSLA", "buy", 50.0, 345.82, "x", db_path=db_path, **FAST)
     submit_and_track(api, "risky1", "TSLA", "buy", 0.1446, 345.82, "x", db_path=db_path, **FAST)
     api.positions["TSLA"]["qty"] = 50.0             # risky1's 0.1446 sold outside the system

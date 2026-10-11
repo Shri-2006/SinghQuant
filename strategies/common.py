@@ -82,6 +82,10 @@ class StrategyContext:
     alert: Callable[..., None] = lambda **kw: None                 # Discord alert
     db_path: Optional[str] = None
     exec_kw: dict = field(default_factory=dict)                    # e.g. sleep_fn/clock_fn for tests
+    # Also require the shared ACCOUNT's cash to cover a buy (restores main's risky2
+    # guard, commit 523f7f6: crypto cannot be bought on margin). Fails closed. (R-3)
+    check_account_cash: bool = False
+    runtime: dict = field(default_factory=dict)                    # per-process state (alert de-duplication)
 
 
 def utcnow():
@@ -533,10 +537,30 @@ def trade_ticker(ctx, api, ticker, df, risk, multiplier=1.0, vix=None, allow_ent
         if not ok:
             print(f"[{s}] {ticker} BUY skipped: {why}")
             return "entry-anti-churn"
-        qty = round((max_pos - owned_value) / price, 4)
+        # Strict per-strategy budget (remediation R-3): never size beyond the cash this
+        # strategy has left after its open buy orders. execution.submit_and_track
+        # re-checks atomically when it reserves the order.
+        budget = portfolio.available_budget(s, ctx.db_path)
+        target_value = max_pos - owned_value
+        capped = target_value > budget
+        qty = round(min(target_value, budget) / price, 4)
+        if qty * price > budget:
+            qty = math.floor(budget / price * 1e4) / 1e4      # rounding must never exceed the budget
         if qty <= 0 or qty * price < MIN_ORDER_NOTIONAL:
+            if capped:
+                print(f"[{s}] Skipping {ticker}: strategy budget exhausted (available ${budget:.2f})")
+                return "budget-exhausted"
             print(f"[{s}] Skipping {ticker}: order ${qty * price:.2f} below minimum")
             return "below-min"
+        if ctx.check_account_cash:
+            try:
+                account_cash = float(api.get_account().cash)
+            except Exception as e:
+                print(f"[{s}] {ticker} BUY skipped: account cash unknown ({e})")
+                return "account-cash-unknown"
+            if account_cash < qty * price:
+                print(f"[{s}] {ticker} BUY skipped: insufficient account cash (${account_cash:.2f} < ${qty * price:.2f})")
+                return "insufficient-account-cash"
         res = submit_and_track(api, s, ticker, "buy", qty, price,
                                reason=f"{decision.note or 'signal BUY'}", model_output=decision.model_output, **log_kw)
         if res.status == "rejected":
@@ -671,6 +695,23 @@ def _alert_suspect_state(ctx, risk):
                     risk.equity)
 
 
+def _alert_negative_budget(ctx, equity):
+    """
+    Market orders fill at the live price while sizing uses the signal price, so
+    slippage can push cash_budget slightly below zero. Sizing then blocks every
+    new buy (available <= 0) until it recovers; alert once per episode (R-3).
+    """
+    cash = portfolio.get_strategy_state(ctx.name, ctx.db_path)["cash_budget"]
+    if cash < -0.01:
+        if not ctx.runtime.get("negative_budget_alerted"):
+            _safe_alert(ctx, "BUDGET OVERDRAWN",
+                        f"{ctx.name} cash budget is ${cash:.2f} (fill slippage above the signal price). "
+                        "New buys are blocked until it is positive again.", equity)
+            ctx.runtime["negative_budget_alerted"] = True
+    else:
+        ctx.runtime["negative_budget_alerted"] = False
+
+
 def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     """
     One full cycle for a strategy. Returns a dict summarising what happened so
@@ -735,6 +776,7 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     summary["risk"] = risk
     _alert_new_discrepancies(ctx, risk.equity)
     _alert_suspect_state(ctx, risk)
+    _alert_negative_budget(ctx, risk.equity)
     if risk.halted:
         log_heartbeat(s, "HALTED", ctx.db_path)
         summary["halted"] = True

@@ -17,6 +17,7 @@ time-in-force). Everything else is common and covered by tests/test_engine.py.
 """
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,11 +25,12 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from core import portfolio
+from core import lifecycle, portfolio
 from core.config import (CAPITAL, MAX_POSITION_SIZE, MIN_HOLD_SECONDS, ONE_ACTION_PER_BAR,
                          KILL_SWITCH_CONFIRMATIONS, STRATEGY_ASSETS, MIN_TOPUP_FRACTION,
                          MARK_MAX_STEP_CHANGE, STALE_BAR_MAX_DAYS, MARK_CROSSCHECK_TOLERANCE,
-                         SUSPECT_ALERT_AFTER_CYCLES, SUSPECT_ALERT_REPEAT_CYCLES, MODEL_ALERT_REPEAT_SECONDS)
+                         SUSPECT_ALERT_AFTER_CYCLES, SUSPECT_ALERT_REPEAT_CYCLES, MODEL_ALERT_REPEAT_SECONDS,
+                         PAUSED_HEARTBEAT_SECONDS)
 from core.execution import (submit_and_track, close_strategy_position, close_all_strategy_positions,
                             reconcile_open_orders, to_broker_symbol, BrokerQuote, broker_quote,
                             record_discrepancy)
@@ -90,6 +92,9 @@ class StrategyContext:
     # artifacts do not validate: new entries are blocked (the decider gets no
     # model) while stops, momentum exits and the kill switch keep running.
     model_status: Callable[[], tuple] = lambda: (True, "")
+    # Phase 2 I-4: set by run.py on SIGTERM. Sleeps wake up, the cycle stops
+    # between tickers (never in the middle of an order) and run_forever returns.
+    stop_event: Optional[threading.Event] = None
 
 
 def utcnow():
@@ -621,6 +626,11 @@ def adopt_unowned_broker_positions(ctx, api):
         ticker = matches[0]
         if ticker in owned:
             continue   # already in this strategy's ledger; only unowned symbols are candidates
+        if portfolio.open_orders(s, ticker, db_path=ctx.db_path):
+            # An order for it is still open locally: its fill will be (or was just)
+            # booked by reconciliation. Adopting too would count it twice (Phase 2 I-4).
+            print(f"[{s}] NOTE: broker holds {p.qty} {ticker} but an order for it is still open; not adopting")
+            continue
         qty, avg = float(p.qty), float(p.avg_entry_price)
         if adopt:
             portfolio.adopt_position(s, ticker, qty, avg, ctx.db_path)
@@ -747,6 +757,29 @@ def _check_models(ctx, now=None):
     return ok, reason
 
 
+def _stopping(ctx):
+    return ctx.stop_event is not None and ctx.stop_event.is_set()
+
+
+def _entry_gates(ctx):
+    """
+    Process-level reasons NEW entries are blocked (Phase 2 I-4). Exits, stops
+    and the kill switch are never gated by these.
+      * startup reconciliation has not completed since this process started;
+      * persistent SAFE MODE after a crash loop (survives restarts).
+    """
+    reasons = []
+    if not ctx.runtime.get("startup_reconciled"):
+        reasons.append("startup reconciliation pending")
+    try:
+        safe = lifecycle.get_safe_mode(ctx.db_path)
+    except Exception as e:                      # unknown state must not allow entries
+        safe = {"reason": f"safe-mode state unreadable: {e}"}
+    if safe:
+        reasons.append(f"SAFE MODE: {safe.get('reason')}")
+    return reasons
+
+
 def _readiness(model_ok, model_reason, risk=None, trading_state=None, extra_reasons=()):
     """
     (ready, degraded_reason) for the heartbeat. ready = the strategy may open
@@ -780,9 +813,11 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     s = ctx.name
     summary = {"strategy": s, "tickers": {}, "paused": 0, "killed": False, "halted": False}
     portfolio.ensure_strategy_state(s, ctx.db_path)
+    orders_reconciled = True
     try:
         reconcile_open_orders(api, s, ctx.db_path)
     except Exception as e:  # reconciliation must never take the whole cycle down (second-pass S-04)
+        orders_reconciled = False
         print(f"[{s}] order reconciliation failed: {e}")
     model_ok, model_reason = _check_models(ctx, now)
     summary["model_ok"], summary["model_reason"] = model_ok, model_reason
@@ -811,6 +846,10 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     # back (second-pass S-02, a regression against the original 20 s spacing).
     frames = {}
     for i, ticker in enumerate(symbols):
+        if _stopping(ctx):
+            print(f"[{s}] shutdown requested during data fetch; no trading this cycle")
+            summary["stopped"] = True
+            return summary
         try:
             frames[ticker] = ctx.fetch_frame(ticker)
         except Exception as e:
@@ -829,9 +868,19 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
     # provides the independent quotes used to validate marks (R-1).
     try:
         broker_quotes = refresh_discrepancies(ctx, api)
+        unknown = sorted(t for t, q in broker_quotes.items() if q.status == "unknown")
+        positions_checked = not unknown
+        if unknown and not ctx.runtime.get("startup_reconciled"):
+            print(f"[{s}] startup reconciliation incomplete: broker state unknown for {unknown}")
     except Exception as e:
         print(f"[{s}] discrepancy check failed: {e}")
         broker_quotes = {}
+        positions_checked = False
+    # Phase 2 I-4: after a (re)start, no NEW entry until open orders have been
+    # reconciled and every held position compared with the broker in one cycle.
+    if orders_reconciled and positions_checked and not ctx.runtime.get("startup_reconciled"):
+        ctx.runtime["startup_reconciled"] = True
+        print(f"[{s}] startup reconciliation complete; entries may resume")
 
     def verify_mark(symbol):
         q = broker_quotes.get(symbol)
@@ -868,11 +917,16 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
 
     from metrics.equity_curve_filter import get_trading_state
     state, multiplier = get_trading_state(s, ctx.db_path)
-    allow_entries = state != "HALT" and risk.level in ("safe", "warning")
+    gate_reasons = _entry_gates(ctx)
+    allow_entries = state != "HALT" and risk.level in ("safe", "warning") and not gate_reasons
     summary["trading_state"] = state
+    summary["entry_gates"] = gate_reasons
     vix = ctx.macro_context()
 
     for ticker in symbols:
+        if _stopping(ctx):
+            print(f"[{s}] shutdown requested; remaining tickers skipped this cycle")
+            break
         try:
             summary["tickers"][ticker] = trade_ticker(ctx, api, ticker, frames.get(ticker), risk, multiplier, vix,
                                                       allow_entries and ticker in ctx.assets, now)
@@ -882,32 +936,66 @@ def run_cycle(ctx, api, sleep_fn=time.sleep, now=None):
         log_heartbeat(s, "RUNNING", ctx.db_path)
 
     _alert_new_discrepancies(ctx, risk.equity)     # flags raised by sells during this cycle
-    ready, degraded = _readiness(model_ok, model_reason, risk, state)
+    ready, degraded = _readiness(model_ok, model_reason, risk, state, gate_reasons)
     summary["ready"], summary["degraded_reason"] = ready, degraded
     log_heartbeat(s, "SUSPECT" if risk.level == "suspect" else "RUNNING", ctx.db_path,
                   ready=ready, degraded_reason=degraded)
     return summary
 
 
-def run_forever(ctx, api=None, sleep_fn=time.sleep, max_cycles=None):
-    """Main loop used by run.py threads. `max_cycles` is for tests."""
+def _paused_wait(ctx, secs, sleep_fn):
+    """
+    A market-closed sleep (up to 48 h) in chunks of PAUSED_HEARTBEAT_SECONDS,
+    writing a PAUSED heartbeat each time, so liveness never goes stale while
+    the bot is healthy and a stop request is honoured promptly (Phase 2 I-4).
+    """
+    remaining = float(secs)
+    while remaining > 0 and not _stopping(ctx):
+        chunk = min(PAUSED_HEARTBEAT_SECONDS, remaining)
+        sleep_fn(chunk)
+        remaining -= chunk
+        if not _stopping(ctx):
+            log_heartbeat(ctx.name, "PAUSED", ctx.db_path)
+
+
+def run_forever(ctx, api=None, sleep_fn=None, max_cycles=None, stop_event=None):
+    """
+    Main loop used by run.py threads. `max_cycles` is for tests.
+
+    Phase 2 I-4: sleeps wait on the stop event (SIGTERM wakes them), long
+    market-closed sleeps keep the heartbeat fresh, and startup reconciles open
+    orders BEFORE adopting any broker position (a fill booked while the
+    process was down must not be adopted and then booked again).
+    """
     from paper_trading.alpaca_paper import get_api
     s = ctx.name
+    if stop_event is not None:
+        ctx.stop_event = stop_event
+    if ctx.stop_event is None:
+        ctx.stop_event = threading.Event()
+    stop = ctx.stop_event
+    sleep_fn = sleep_fn or (lambda secs: stop.wait(secs))
     api = api or get_api(s)
     print(f"{s} bot started (paper endpoint check: {getattr(api, '_base_url', 'n/a')})")
     portfolio.ensure_strategy_state(s, ctx.db_path)
+    try:
+        reconcile_open_orders(api, s, ctx.db_path)
+    except Exception as e:
+        print(f"[{s}] startup order reconciliation failed: {e}")
     adopt_unowned_broker_positions(ctx, api)
     last_trade_time = utcnow()
     cycles = 0
-    while max_cycles is None or cycles < max_cycles:
+    while (max_cycles is None or cycles < max_cycles) and not stop.is_set():
         cycles += 1
         try:
             summary = run_cycle(ctx, api, sleep_fn)
+            if summary.get("stopped") or stop.is_set():
+                break
             if summary["paused"]:
                 secs = summary["paused"]
                 print(f"[{s}] Market is closed - sleeping for {secs // 3600}h {(secs % 3600) // 60}m")
                 _safe_notify(ctx, api, s, "Market closed", f"Sleeping {secs // 3600}h - market closed")
-                sleep_fn(secs)
+                _paused_wait(ctx, secs, sleep_fn)
                 continue
             if summary["halted"] or summary["killed"]:
                 sleep_fn(300)
@@ -923,6 +1011,9 @@ def run_forever(ctx, api=None, sleep_fn=time.sleep, max_cycles=None):
         except Exception as e:
             print(f"[{s}] Unexpected error: {e} - restarting in 60 seconds")
             sleep_fn(60)
+    if stop.is_set():
+        log_heartbeat(s, "STOPPED", ctx.db_path, ready=False, degraded_reason="process shutting down")
+        print(f"[{s}] stopped cleanly")
 
 
 def _safe_notify(ctx, api, s, last_trade_time, extra):

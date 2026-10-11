@@ -195,3 +195,13 @@ SUSPECT_ALERT_REPEAT_CYCLES = 12
 # Phase 2 I-3: an unavailable or invalid model is alerted when first seen and
 # again every MODEL_ALERT_REPEAT_SECONDS while it persists (alerting only).
 MODEL_ALERT_REPEAT_SECONDS = 6 * 3600
+
+# Phase 2 I-4: process lifecycle (operational settings, not risk thresholds).
+PAUSED_HEARTBEAT_SECONDS = 300        # a market-closed sleep still writes a heartbeat this often
+WATCHDOG_INTERVAL_SECONDS = 30        # how often run.py checks its strategy threads
+WATCHDOG_HANG_SECONDS = 1800          # alive thread with no heartbeat for this long = hung
+SHUTDOWN_GRACE_SECONDS = 45           # SIGTERM: time allowed for threads to finish (compose grants 60)
+CRASH_LOOP_WINDOW_SECONDS = 3600      # unclean exits are counted over this window
+SAFE_MODE_AFTER_UNCLEAN_EXITS = 3     # this many recent unclean exits -> persistent SAFE MODE (no new entries)
+MAX_WATCHDOG_RESTARTS = 5             # beyond this many, a dead thread no longer exits the process (no endless loop)
+FATAL_STARTUP_EXIT_DELAY_SECONDS = 300  # a fatal config error waits before exiting so restarts stay slow

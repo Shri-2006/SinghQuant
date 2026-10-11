@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timezone
 from core.config import (CAPITAL, STRATEGY_COLORS, HEARTBEAT_STALE_SECONDS,MAX_DRAWDOWN, WARNING_DRAWDOWN)
-from core.logger import get_trades, get_heartbeat
+from core.logger import get_trades, get_heartbeat, get_heartbeat_full, schema_ready
 from metrics.risk import compute_all_metrics
 from paper_trading.alpaca_paper import get_api
 #https://emojidb.org/dashboard-emojis
@@ -12,6 +12,29 @@ from paper_trading.alpaca_paper import get_api
 st.set_page_config(page_title="TradingSystem Control Panel", page_icon= "🌐", layout="wide",initial_sidebar_state="collapsed")
 
 STRATEGIES=["stable","risky1","risky2"]
+
+# Phase 2: the dashboard is read-only (SINGHQUANT_DB_READONLY=1 in compose) and
+# relies on the migrate service. Say so plainly if the schema is not there yet.
+if not schema_ready():
+    st.error("The trade database has not been migrated yet (or is unreachable). "
+             "The `migrate` service must complete before the dashboard can show data.")
+    st.stop()
+
+
+def get_readiness(strategy):
+    """(ready, degraded_reason) from the heartbeat; ready=None if the bot never reported it."""
+    hb = get_heartbeat_full(strategy)
+    if hb is None:
+        return None, None
+    return hb["ready"], hb["degraded_reason"]
+
+
+def get_safe_mode():
+    try:
+        from core import lifecycle
+        return lifecycle.get_safe_mode()
+    except Exception:
+        return None
 
 def get_heartbeat_status(strategy):
     """
@@ -38,6 +61,8 @@ def heartbeat_indicator (status):
         return "⛔ Halted (kill switch)"
     elif status == "SUSPECT":
         return "🟠 Suspect data (entries blocked)"
+    elif status == "STOPPED":
+        return "⚪ Stopped"
     else:
         return "🔴 Bot Disconnected"
     
@@ -89,13 +114,22 @@ with tab1:
         st.warning(f"The portfolio data was unable to be fetched: {e}")
     
     st.subheader("System Status")
+    safe = get_safe_mode()
+    if safe:
+        st.error(f"SAFE MODE since {safe.get('since')}: {safe.get('reason')}. New entries are blocked for every "
+                 "strategy; existing positions are still risk-managed. Clear with `python -m tools.safe_mode clear`.")
     cols=st.columns(3)
     for i, strategy in enumerate(STRATEGIES):
         status=get_heartbeat_status(strategy)
         color=STRATEGY_COLORS[strategy]
         with cols[i]:
             st.markdown(f"**{strategy.upper()}**")
-            st.markdown(heartbeat_indicator(status))
+            st.markdown(heartbeat_indicator(status))          # liveness
+            ready, degraded = get_readiness(strategy)       # readiness + degraded reasons, reported separately
+            if status != "DISCONNECTED" and ready is not None:
+                st.markdown("✅ Ready for new entries" if ready else "🟠 Degraded: no new entries")
+            if degraded:
+                st.caption(degraded)
 
 
 

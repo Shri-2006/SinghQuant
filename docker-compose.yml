@@ -1,23 +1,72 @@
-version: '3.8'
+# SinghQuant (Phase 2 infrastructure). See docs/DEPLOYMENT.md before the first start
+# on a host that ran the old single-file layout: the database must be cut over.
+#
+# Start order: migrate (one-shot schema migration) -> trading_bots + dashboard.
+# Host directories:
+#   ./data             trades.db AND its -wal / -shm files (one shared directory)
+#   ./model_artifacts  model files + manifest.json (bots only; survives rebuilds)
+
+x-common: &common
+  build: .
+  image: singhquant:local
+  env_file:
+    - .env
+  init: true                     # tini as PID 1: forwards SIGTERM to Python, reaps zombies
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
 
 services:
-  trading_bots:
-    build: .
-    env_file:
-      - .env
+  migrate:
+    <<: *common
+    command: ["python", "-m", "tools.db_maintenance", "migrate"]
+    environment:
+      SINGHQUANT_DB_PATH: /app/data/trades.db
     volumes:
-      - ./trades.db:/app/trades.db
-#Transfer trades from the container to trades in dashboard container so they have the same file
-    restart: unless-stopped
+      - ./data:/app/data
+    restart: "no"                # one-shot: a failure must stop the stack, not loop
+
+  trading_bots:
+    <<: *common
+    command: ["python", "run.py"]
+    environment:
+      SINGHQUANT_DB_PATH: /app/data/trades.db
+      SINGHQUANT_MODEL_DIR: /app/model_artifacts
+    volumes:
+      - ./data:/app/data
+      - ./model_artifacts:/app/model_artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped      # run.py limits its own restarts (crash-loop safe mode)
+    stop_signal: SIGTERM
+    stop_grace_period: 60s       # run.py allows threads 45 s to finish the current step
+    healthcheck:                 # LIVENESS only: degraded-but-alive is healthy (readiness is reported separately)
+      test: ["CMD", "python", "-m", "tools.healthcheck", "liveness"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 300s
 
   dashboard:
-    build: .
-    command: streamlit run dashboard/streamlit_app_v2.py --server.port 8501 --server.address 0.0.0.0
-    env_file:
-      - .env
+    <<: *common
+    command: ["streamlit", "run", "dashboard/streamlit_app_v2.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    environment:
+      SINGHQUANT_DB_PATH: /app/data/trades.db
+      SINGHQUANT_DB_READONLY: "1"          # never migrates or writes
     volumes:
-      - ./trades.db:/app/trades.db
+      - ./data:/app/data                   # read-write mount: SQLite readers still need the -shm file
     ports:
-      - "8501:8501"
-#port on left is actual machine/server port, right side is port in docker
+      - "8501:8501"                        # host:container
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "tools.healthcheck", "dashboard"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

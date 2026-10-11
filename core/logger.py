@@ -450,5 +450,7 @@ def get_trades_full(strategy=None, db_path=None):
 
 # Initialize (or migrate) the database on import. Read-only processes (the
 # dashboard) never write; they rely on the migrate service having run.
-if not READONLY:
+# Tools and run.py set SINGHQUANT_NO_AUTO_MIGRATE=1 before importing so they
+# can check the storage first and migrate explicitly (or not at all).
+if not READONLY and os.getenv("SINGHQUANT_NO_AUTO_MIGRATE", "") != "1":
     init_db()

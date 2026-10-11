@@ -108,6 +108,13 @@ def _migrate(conn):
         conn.execute('ALTER TABLE positions ADD COLUMN last_mark REAL')
     if 'last_mark_at' not in pos_cols:
         conn.execute('ALTER TABLE positions ADD COLUMN last_mark_at TEXT')
+    # Remediation R-1: a ledger quantity the broker no longer holds is FLAGGED
+    # (never written off automatically). The flag is informational: qty and
+    # avg_entry_price are untouched until a human reconciles it.
+    for name, ctype in (('discrepancy_qty', 'REAL'), ('discrepancy_reason', 'TEXT'),
+                        ('discrepancy_since', 'TEXT'), ('discrepancy_alerted', 'INTEGER NOT NULL DEFAULT 0')):
+        if name not in pos_cols:
+            conn.execute(f'ALTER TABLE positions ADD COLUMN {name} {ctype}')
     # Journal of every ledger mutation. Broker fills carry a broker_order_id;
     # internal reconciliation events (WRITE_OFF_*) never do (third-pass T-05).
     conn.execute('''
@@ -141,6 +148,9 @@ def _migrate(conn):
             updated_at      TEXT NOT NULL
         )
     ''')
+    # Remediation R-1: consecutive cycles whose risk reading was "suspect".
+    if 'suspect_streak' not in _existing_columns(conn, "strategy_state"):
+        conn.execute('ALTER TABLE strategy_state ADD COLUMN suspect_streak INTEGER NOT NULL DEFAULT 0')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS signal_state (
             strategy        TEXT NOT NULL,

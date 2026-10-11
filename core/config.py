@@ -183,3 +183,11 @@ STRATEGY_COLORS={ ## gained from LLM, wasn't sure how to implement this on my ow
 # A full cycle takes 4 tickers x 20 s + 60 s (risky1) up to 8 x 20 s + 60 s
 # (stable), so the old value of 60 s marked healthy bots as DISCONNECTED.
 HEARTBEAT_STALE_SECONDS = 600
+
+# Remediation R-1 (owner decision D2): alerting only, NOT a risk threshold.
+# A "suspect" risk reading (broker state unknown) blocks new entries and the
+# kill switch for that cycle. After this many consecutive suspect cycles an
+# alert is sent, then repeated every SUSPECT_ALERT_REPEAT_CYCLES cycles. No
+# position is liquidated because of an API outage.
+SUSPECT_ALERT_AFTER_CYCLES = 3
+SUSPECT_ALERT_REPEAT_CYCLES = 12

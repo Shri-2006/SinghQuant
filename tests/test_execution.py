@@ -187,12 +187,19 @@ def test_missing_mark_uses_entry_price_not_zero(db_path):
     assert missing == ["SPY"] and eq == pytest.approx(1000.0)
 
 
-def test_ledger_drift_written_off_when_broker_has_nothing(db_path):
-    """A legacy close_all_positions() sold our shares outside the ledger."""
+def test_ledger_drift_is_flagged_not_written_off_when_broker_has_nothing(db_path):
+    """A legacy close_all_positions() sold our shares outside the ledger.
+    Remediation R-1 (owner decision D1-B): flag and preserve, never write off automatically."""
     api = FakeAlpaca(prices={"SPY": 500.0})
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
+    cash_before = portfolio.get_strategy_state("stable", db_path)["cash_budget"]
     api.positions.clear()  # something else liquidated the account
     res = close_strategy_position(api, "stable", "SPY", 500.0, "ML SELL", db_path=db_path, **FAST)
-    assert res.status == "reconciled"
-    assert portfolio.get_position_qty("stable", "SPY", db_path) == 0.0
-    assert get_trades_full("stable", db_path)[-1]["action"] == "RECONCILE"
+    assert res.status == "discrepancy"
+    assert portfolio.get_position_qty("stable", "SPY", db_path) == pytest.approx(0.4)        # ledger preserved
+    assert portfolio.get_discrepancy_qty("stable", "SPY", db_path) == pytest.approx(0.4)     # and flagged
+    assert portfolio.get_strategy_state("stable", db_path)["cash_budget"] == cash_before     # no cash credited
+    assert portfolio.list_ledger_events("stable", "SPY", event_type="WRITE_OFF_DRIFT", db_path=db_path) == []
+    last = get_trades_full("stable", db_path)[-1]
+    assert last["action"] == "RECONCILE" and last["status"] == "discrepancy_flagged"
+    assert not any(o["side"] == "sell" for o in api.submitted)

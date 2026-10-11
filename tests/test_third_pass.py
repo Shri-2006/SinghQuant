@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from core import portfolio
-from core.execution import (submit_and_track, close_strategy_position, broker_position_qty,
+from core.execution import (submit_and_track, close_strategy_position, broker_position_qty, manual_write_off,
                             close_all_strategy_positions)
 from core.logger import get_trades_full
 from metrics.risk_manager import (get_atr_adjusted_thresholds, risk_level_from_drawdown,
@@ -40,13 +40,17 @@ def _equity(strategy, marks, db_path):
 # T-01 ----------------------------------------------------------------------
 
 def test_t01_drift_write_off_never_increases_equity_or_books_a_gain(db_path):
+    """R-1: drift is flagged first; the (manual) write-off keeps the T-01 accounting guarantees."""
     api = FakeAlpaca(prices={"SPY": 500.0})
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
     api.set_price("SPY", 600.0)                      # unrealized gain of $40
     api.positions.clear()                            # shares vanished (sold outside the system)
     before = _equity("stable", {"SPY": 600.0}, db_path)
     res = close_strategy_position(api, "stable", "SPY", 600.0, "ML SELL", db_path=db_path, **FAST)
-    assert res.status == "reconciled"
+    assert res.status == "discrepancy"
+    # while flagged, the vanished shares are valued at min(mark, cost): the gain is not counted
+    assert _equity("stable", {"SPY": 600.0}, db_path) == pytest.approx(1000.0)
+    manual_write_off("stable", "SPY", 600.0, "test: confirmed sold outside the system", db_path=db_path)
     after = _equity("stable", {}, db_path)
     assert after <= before + 1e-9                    # equity can only go down or stay
     assert after == pytest.approx(1000.0)            # credited at min(mark, cost) = cost: the gain is forfeited
@@ -62,7 +66,11 @@ def test_t01_drift_write_off_at_a_loss_realizes_the_loss_not_a_gain(db_path):
     submit_and_track(api, "stable", "SPY", "buy", 0.4, 500.0, "x", db_path=db_path, **FAST)
     api.positions.clear()
     res = close_strategy_position(api, "stable", "SPY", 400.0, "ML SELL", db_path=db_path, **FAST)
-    assert res.status == "reconciled"
+    assert res.status == "discrepancy"
+    # flagged: the loss counts in equity (conservative valuation) but is NOT realized
+    assert _equity("stable", {"SPY": 400.0}, db_path) == pytest.approx(1000.0 - 0.4 * 100.0)
+    assert portfolio.list_ledger_events("stable", "SPY", event_type="WRITE_OFF_DRIFT", db_path=db_path) == []
+    manual_write_off("stable", "SPY", 400.0, "test", db_path=db_path)
     assert _equity("stable", {}, db_path) == pytest.approx(1000.0 - 0.4 * 100.0)
     ev = portfolio.list_ledger_events("stable", "SPY", event_type="WRITE_OFF_DRIFT", db_path=db_path)[-1]
     assert ev["price"] == pytest.approx(400.0) and "realized_estimate=-40.000000" in ev["extra"]
@@ -91,7 +99,11 @@ def test_t01_apply_fill_is_not_used_for_internal_write_offs(db_path):
     api.positions["AAPL"]["qty"] = 1.2
     close_strategy_position(api, "risky1", "AAPL", 200.0, "x", db_path=db_path, **FAST)
     kinds = [e["event_type"] for e in portfolio.list_ledger_events("risky1", "AAPL", db_path=db_path)]
-    assert kinds == ["FILL", "WRITE_OFF_DRIFT", "FILL"]      # buy, drift write-off of 0.3, real sale of 0.2
+    assert kinds == ["FILL", "FILL"]                         # buy, real sale of 0.2; the missing 0.3 is only flagged
+    manual_write_off("risky1", "AAPL", 200.0, "test", db_path=db_path)
+    kinds = [e["event_type"] for e in portfolio.list_ledger_events("risky1", "AAPL", db_path=db_path)]
+    assert kinds == ["FILL", "FILL", "WRITE_OFF_DRIFT"]
+    assert portfolio.get_position_qty("risky1", "AAPL", db_path) == 0.0
     fills = [e for e in portfolio.list_ledger_events("risky1", "AAPL", event_type="FILL", db_path=db_path)]
     assert all(e["broker_order_id"] for e in fills)
 
@@ -260,6 +272,9 @@ def test_t05_every_inventory_change_is_journaled_with_provenance(db_path):
     api.fill_mode = "fill"
     api.positions.clear()
     close_strategy_position(api, "stable", "SPY", 480.0, "ML SELL", db_path=db_path, **FAST)
+    # R-1: the drift is flagged only; no ledger mutation until a human writes it off
+    assert [e["event_type"] for e in portfolio.list_ledger_events("stable", db_path=db_path)] == ["FILL", "FILL", "ADOPT"]
+    manual_write_off("stable", "SPY", 480.0, "test", db_path=db_path)
     events = portfolio.list_ledger_events("stable", db_path=db_path)
     kinds = [(e["symbol"], e["event_type"]) for e in events]
     assert kinds == [("SPY", "FILL"), ("SPY", "FILL"), ("QQQ", "ADOPT"), ("SPY", "WRITE_OFF_DRIFT")]
@@ -271,7 +286,7 @@ def test_t05_every_inventory_change_is_journaled_with_provenance(db_path):
         else:
             assert e["broker_order_id"] is None
     wo = events[-1]
-    assert "account_qty=0.0" in wo["extra"] and "others_claim=0.0" in wo["extra"]
+    assert "manual write-off of flagged discrepancy" in wo["reason"]
     # the ledger's cash budget equals CAPITAL + the sum of all journaled cash deltas
     cash = portfolio.get_strategy_state("stable", db_path)["cash_budget"]
     assert cash == pytest.approx(1000.0 + sum(e["cash_delta"] for e in events))

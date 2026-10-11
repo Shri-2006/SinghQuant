@@ -20,9 +20,11 @@ This is the ONLY module that should submit or close orders. It guarantees:
   * fills, partial fills and rejections are read back from the broker and
     applied to the ledger in the same transaction that records them on the
     order row,                                         -> audit H-03/H-06, S-05
-  * internal reconciliation (inventory missing at the broker) goes through
-    portfolio.write_off, which is journaled separately from fills and can
-    never increase equity; unsellable dust is left alone,  -> third pass T-01
+  * inventory missing at the broker is FLAGGED, never written off
+    automatically: the ledger, cost and ownership are preserved and a human
+    reconciles it (tools/reconcile_position.py -> portfolio.write_off, which
+    is journaled separately from fills and can never increase equity);
+    unsellable dust is left alone,          -> remediation R-1 (owner decision D1-B), T-01
   * every quantity is a share/coin quantity; dollars are converted exactly
     once, in the strategy's sizing step.
 
@@ -115,13 +117,14 @@ def _is_not_found(exc):
 
 def _is_position_not_found(exc):
     """
-    AUTHORITATIVE 'no such position' only (third pass T-03). Alpaca answers a
-    missing position with HTTP 404 and JSON code 40410000 'position does not
-    exist'. Anything else (timeout, 5xx, 429, connection errors, auth errors)
-    is unknown state and must not be read as zero.
+    AUTHORITATIVE 'no such position' only (third pass T-03, tightened in
+    remediation R-1). Alpaca answers a missing position with HTTP 404 and JSON
+    code 40410000 'position does not exist'. Only that code or that message
+    counts. A bare 404 (wrong base URL or route, symbol-format drift, a proxy)
+    is NOT proof the position is gone, because "absent" now drives ledger
+    flags and risk valuation. Anything else (timeout, 5xx, 429, connection or
+    auth errors) is unknown state and must not be read as zero.
     """
-    if _exc_status_code(exc) == 404:
-        return True
     if _exc_alpaca_code(exc) == ALPACA_POSITION_NOT_FOUND_CODE:
         return True
     return "position does not exist" in str(exc).lower()
@@ -145,6 +148,43 @@ def broker_position_qty(api, broker_symbol):
     except Exception as e:
         print(f"[execution] broker position for {broker_symbol} unreadable: {e}")
         return None, False
+
+
+@dataclass
+class BrokerQuote:
+    """
+    What the broker says about one account position.
+    status: "ok"      -> position exists; qty and (usually) price are set
+            "absent"  -> broker AUTHORITATIVELY reports no position
+            "unknown" -> transient failure; nothing may be inferred
+    """
+    status: str
+    qty: Optional[float] = None
+    price: Optional[float] = None
+
+
+def broker_quote(api, broker_symbol):
+    """One position lookup, classified as ok / absent / unknown (remediation R-1)."""
+    try:
+        pos = api.get_position(broker_symbol)
+    except Exception as e:
+        if _is_position_not_found(e):
+            return BrokerQuote("absent", 0.0, None)
+        print(f"[execution] broker position lookup for {broker_symbol} failed (unknown state): {e}")
+        return BrokerQuote("unknown")
+    try:
+        qty = float(pos.qty)
+    except Exception as e:
+        print(f"[execution] broker position for {broker_symbol} unreadable: {e}")
+        return BrokerQuote("unknown")
+    price = None
+    try:
+        price = float(pos.current_price)
+        if not (math.isfinite(price) and price > 0):
+            price = None
+    except Exception:
+        price = None
+    return BrokerQuote("ok", qty, price)
 
 
 def _age_hours(iso_ts):
@@ -259,13 +299,39 @@ def has_open_order(api, strategy, symbol, db_path=None):
     return any(o["symbol"] == symbol for o in reconcile_open_orders(api, strategy, db_path=db_path))
 
 
-def _record_write_off(strategy, symbol, qty, mark, reason, risk_state, owned_qty, account_qty, others, db_path):
-    """Internal reconciliation: ledger write-off + a visible RECONCILE row in `trades`."""
-    credited, realized = portfolio.write_off(strategy, symbol, qty, mark, reason,
-                                             account_qty_observed=account_qty, others_claim=others, db_path=db_path)
-    log_trade(strategy, symbol, "RECONCILE", mark, qty, pnl=realized if realized else None, reason=reason,
-              status="written_off", strategy_position_before=owned_qty, account_position_before=account_qty,
-              risk_state=risk_state, db_path=db_path)
+def record_discrepancy(strategy, symbol, missing_qty, mark, reason, risk_state=None, owned_qty=None,
+                       account_qty=None, others=None, db_path=None):
+    """
+    Flags `missing_qty` as not held at the broker (owner decision D1-B: no
+    automatic write-off). When the flag is new or changed, a visible RECONCILE
+    row with status "discrepancy_flagged" is written to `trades`; cash,
+    quantity, cost and ownership are untouched. Returns True if it changed.
+    """
+    detail = f"{reason}; ledger {owned_qty}, account {account_qty}, claimed by others {others}"
+    changed = portfolio.flag_discrepancy(strategy, symbol, missing_qty, detail, db_path=db_path)
+    if changed:
+        print(f"[execution] DISCREPANCY {strategy} {symbol}: {missing_qty} flagged for manual reconciliation ({detail})")
+        log_trade(strategy, symbol, "RECONCILE", mark or 0.0, missing_qty, pnl=None, reason=detail,
+                  status="discrepancy_flagged", strategy_position_before=owned_qty,
+                  account_position_before=account_qty, risk_state=risk_state, db_path=db_path)
+    return changed
+
+
+def manual_write_off(strategy, symbol, mark, operator_note, db_path=None):
+    """
+    HUMAN-INITIATED resolution of a flagged discrepancy (tools/reconcile_position.py).
+    Writes off exactly the flagged quantity through portfolio.write_off (cash
+    credited at min(mark, cost); never a gain), journaled as WRITE_OFF_DRIFT,
+    plus a RECONCILE row with status "written_off". Never called by the engine.
+    """
+    missing = portfolio.get_discrepancy_qty(strategy, symbol, db_path=db_path)
+    if missing <= 0:
+        raise ValueError(f"{strategy} {symbol} has no flagged discrepancy to write off")
+    owned_qty = portfolio.get_position_qty(strategy, symbol, db_path=db_path)
+    reason = f"manual write-off of flagged discrepancy: {operator_note}"
+    credited, realized = portfolio.write_off(strategy, symbol, missing, mark, reason, db_path=db_path)
+    log_trade(strategy, symbol, "RECONCILE", mark or 0.0, missing, pnl=realized if realized else None, reason=reason,
+              status="written_off", strategy_position_before=owned_qty, db_path=db_path)
     return credited, realized
 
 
@@ -307,22 +373,22 @@ def submit_and_track(api, strategy, symbol, side, qty, signal_price, reason,
             # Fail closed (third pass T-03): unknown broker state is not zero inventory.
             return OrderResult(strategy, symbol, side, qty, "refused",
                                message=f"broker position for {symbol} unknown (transient error); not selling this cycle")
-        # The account is shared. Honour every OTHER strategy's ledger claim first; this
-        # strategy may only sell what is left (second-pass S-03). If nothing is left, the
-        # shares were sold outside this strategy and the ledger is written off (T-01).
+        # The account is shared. Honour every OTHER strategy's (unflagged) ledger claim
+        # first; this strategy may only sell what is left (second-pass S-03). Whatever this
+        # strategy owns beyond that is not at the broker: it is FLAGGED for manual
+        # reconciliation and left in the ledger (remediation R-1, owner decision D1-B).
         others = portfolio.total_ledger_qty(symbol, exclude_strategy=strategy, db_path=db_path)
         available = max(0.0, account_qty_before - others)
         if available + 1e-9 < qty:
-            print(f"[execution] DRIFT {strategy} {symbol}: ledger {owned_qty}, account {account_qty_before}, "
-                  f"claimed by others {others}, available {available}")
             missing = owned_qty - available
-            _record_write_off(strategy, symbol, missing, signal_price or avg_entry,
-                              "ledger quantity missing at broker; written off", risk_state,
-                              owned_qty, account_qty_before, others, db_path)
+            record_discrepancy(strategy, symbol, missing, signal_price or avg_entry,
+                               "ledger quantity missing at broker", risk_state,
+                               owned_qty, account_qty_before, others, db_path)
             qty = available
             if qty <= 0:
-                return OrderResult(strategy, symbol, side, missing, "reconciled",
-                                   message="position no longer exists at broker; ledger written off")
+                return OrderResult(strategy, symbol, side, missing, "discrepancy",
+                                   message=f"{symbol} not held at broker; {missing} flagged for manual "
+                                           "reconciliation, ledger preserved")
         if qty * (signal_price or avg_entry) < MIN_SELL_NOTIONAL:
             # Below the broker minimum: unsellable dust. Leave it in the ledger (it is
             # still real inventory) and do nothing; never credit cash for shares that
@@ -409,9 +475,16 @@ def close_all_strategy_positions(api, strategy, mark_prices, reason, time_in_for
     """
     Emergency exit for ONE strategy: closes each position in its own ledger.
     Replaces api.close_all_positions(), which liquidated every strategy.
+    A position whose whole quantity is flagged as missing at the broker has
+    nothing to sell; it is reported as "discrepancy" without a broker call.
     """
     results = []
+    flagged = {sym: d["missing_qty"] for (_, sym), d in portfolio.get_discrepancies(strategy, db_path=db_path).items()}
     for symbol, (qty, avg, _) in portfolio.list_positions(strategy, db_path=db_path).items():
+        if qty - flagged.get(symbol, 0.0) <= 1e-9:
+            results.append(OrderResult(strategy, symbol, "sell", qty, "discrepancy",
+                                       message="entire position flagged as missing at broker; awaiting manual reconciliation"))
+            continue
         px = mark_prices.get(symbol) or avg
         results.append(close_strategy_position(api, strategy, symbol, px, reason,
                                                time_in_force=time_in_force, risk_state=risk_state,

@@ -18,7 +18,7 @@ This module keeps, per strategy, in SQLite:
   * orders         : BROKER orders this strategy submitted (broker semantics only)
   * ledger_events  : the journal of EVERY inventory/cash mutation and why
                      (FILL = broker fill, ADOPT = migration, WRITE_OFF_DRIFT =
-                     internal reconciliation). Third pass T-01/T-05: internal
+                     manual reconciliation of a flagged discrepancy, R-1). Third pass T-01/T-05: internal
                      accounting events are never represented as broker orders
                      or fills, and can never increase equity.
 
@@ -59,17 +59,20 @@ def ensure_strategy_state(strategy, db_path=None):
 def get_strategy_state(strategy, db_path=None):
     ensure_strategy_state(strategy, db_path)
     with db_connection(db_path) as conn:
-        row = conn.execute('''SELECT cash_budget, peak_equity, last_equity, critical_streak, halted, halted_reason
+        row = conn.execute('''SELECT cash_budget, peak_equity, last_equity, critical_streak, halted, halted_reason,
+                                     suspect_streak
                               FROM strategy_state WHERE strategy = ?''', (strategy,)).fetchone()
     return {
         "cash_budget": row[0], "peak_equity": row[1], "last_equity": row[2],
         "critical_streak": row[3], "halted": bool(row[4]), "halted_reason": row[5],
+        "suspect_streak": int(row[6] or 0),
     }
 
 
 def update_strategy_state(strategy, db_path=None, **fields):
     ensure_strategy_state(strategy, db_path)
-    allowed = {"cash_budget", "peak_equity", "last_equity", "critical_streak", "halted", "halted_reason"}
+    allowed = {"cash_budget", "peak_equity", "last_equity", "critical_streak", "halted", "halted_reason",
+               "suspect_streak"}
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"unknown strategy_state fields: {bad}")
@@ -131,19 +134,131 @@ def set_last_marks(strategy, marks, db_path=None):
                              (float(px), now, strategy, symbol))
 
 
+def lower_last_marks(strategy, marks, db_path=None):
+    """
+    Ratchet-DOWN update of last_mark (used for flagged positions, R-1): the
+    reference price of a position the broker no longer shows can only move
+    down, so a genuine gradual decline is followed while a single implausible
+    print (beyond MARK_MAX_STEP_CHANGE) is still rejected against it.
+    """
+    if not marks:
+        return
+    now = utc_now_iso()
+    with db_connection(db_path) as conn:
+        for symbol, px in marks.items():
+            if px is not None and px > 0:
+                conn.execute('''UPDATE positions SET last_mark = ?, last_mark_at = ?
+                                WHERE strategy = ? AND symbol = ?
+                                  AND (last_mark IS NULL OR last_mark > ?)''',
+                             (float(px), now, strategy, symbol, float(px)))
+
+
 def total_ledger_qty(symbol, exclude_strategy=None, db_path=None):
     """
     Total quantity of `symbol` claimed by every strategy's ledger (optionally
     excluding one). Used by the execution layer to make sure the sum of all
     ledgers never exceeds what the shared account holds (second-pass S-03).
+    Quantity FLAGGED as missing at the broker (remediation R-1) is not a claim
+    on the account's shares: it is excluded, so a vanished position in one
+    strategy cannot block another strategy from selling what it really owns.
     """
+    claim = 'COALESCE(SUM(qty - COALESCE(discrepancy_qty, 0)), 0)'
     with db_connection(db_path) as conn:
         if exclude_strategy is None:
-            row = conn.execute('SELECT COALESCE(SUM(qty), 0) FROM positions WHERE symbol = ?', (symbol,)).fetchone()
+            row = conn.execute(f'SELECT {claim} FROM positions WHERE symbol = ?', (symbol,)).fetchone()
         else:
-            row = conn.execute('SELECT COALESCE(SUM(qty), 0) FROM positions WHERE symbol = ? AND strategy != ?',
+            row = conn.execute(f'SELECT {claim} FROM positions WHERE symbol = ? AND strategy != ?',
                                (symbol, exclude_strategy)).fetchone()
-    return float(row[0] or 0.0)
+    return max(0.0, float(row[0] or 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Discrepancy flags (remediation R-1, owner decision D1 option B)
+#
+# When the broker no longer holds (part of) a quantity this strategy's ledger
+# owns, the missing quantity is FLAGGED on the position row. Nothing else
+# changes: qty, average entry, cash and ownership are preserved, no loss is
+# realized, and nothing is journaled as a fill or write-off. A human resolves
+# the flag with tools/reconcile_position.py. Flagged quantity is valued
+# conservatively (see strategy_equity) and is not a claim on account shares.
+# ---------------------------------------------------------------------------
+
+def get_discrepancies(strategy=None, db_path=None):
+    """{(strategy, symbol): {...}} for every position with a flagged quantity."""
+    sql = ('''SELECT strategy, symbol, qty, avg_entry_price, last_mark, discrepancy_qty, discrepancy_reason,
+                     discrepancy_since, discrepancy_alerted
+              FROM positions WHERE discrepancy_qty IS NOT NULL AND discrepancy_qty > 0''')
+    params = ()
+    if strategy:
+        sql += ' AND strategy = ?'
+        params = (strategy,)
+    with db_connection(db_path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return {(r[0], r[1]): {"qty": float(r[2]), "avg_entry_price": float(r[3]),
+                           "last_mark": None if r[4] is None else float(r[4]),
+                           "missing_qty": float(r[5]), "reason": r[6], "since": r[7], "alerted": bool(r[8])}
+            for r in rows}
+
+
+def get_discrepancy_qty(strategy, symbol, db_path=None):
+    with db_connection(db_path) as conn:
+        row = conn.execute('SELECT discrepancy_qty FROM positions WHERE strategy = ? AND symbol = ?',
+                           (strategy, symbol)).fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
+def flag_discrepancy(strategy, symbol, missing_qty, reason, db_path=None):
+    """
+    Flags `missing_qty` of this strategy's `symbol` as not held at the broker.
+    Never changes qty, cost, cash or ownership. Returns True when the flag is
+    new or its quantity changed (callers log/alert only on change).
+    """
+    missing_qty = float(missing_qty)
+    with db_connection(db_path) as conn:
+        row = conn.execute('SELECT qty, discrepancy_qty FROM positions WHERE strategy = ? AND symbol = ?',
+                           (strategy, symbol)).fetchone()
+        if row is None or missing_qty <= 0:
+            return False
+        missing_qty = min(missing_qty, float(row[0]))
+        old = float(row[1]) if row[1] is not None else 0.0
+        if old > 0 and abs(old - missing_qty) <= 1e-9 * max(1.0, old):
+            return False
+        now = utc_now_iso()
+        if old > 0:
+            conn.execute('''UPDATE positions SET discrepancy_qty = ?, discrepancy_reason = ?, discrepancy_alerted = 0
+                            WHERE strategy = ? AND symbol = ?''', (missing_qty, reason, strategy, symbol))
+        else:
+            conn.execute('''UPDATE positions SET discrepancy_qty = ?, discrepancy_reason = ?, discrepancy_since = ?,
+                            discrepancy_alerted = 0 WHERE strategy = ? AND symbol = ?''',
+                         (missing_qty, reason, now, strategy, symbol))
+    return True
+
+
+def clear_discrepancy(strategy, symbol, db_path=None):
+    """Removes a flag (the broker holds the quantity again, or a human resolved it). Returns True if one existed."""
+    with db_connection(db_path) as conn:
+        cur = conn.execute('''UPDATE positions SET discrepancy_qty = NULL, discrepancy_reason = NULL,
+                               discrepancy_since = NULL, discrepancy_alerted = 0
+                               WHERE strategy = ? AND symbol = ? AND discrepancy_qty IS NOT NULL''', (strategy, symbol))
+        return cur.rowcount > 0
+
+
+def mark_discrepancy_alerted(strategy, symbol, db_path=None):
+    with db_connection(db_path) as conn:
+        conn.execute('UPDATE positions SET discrepancy_alerted = 1 WHERE strategy = ? AND symbol = ?', (strategy, symbol))
+
+
+def conservative_price(*prices):
+    """Lowest valid (finite, positive) price among the candidates, or None."""
+    valid = []
+    for p in prices:
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(p) and p > 0:
+            valid.append(p)
+    return min(valid) if valid else None
 
 
 def _insert_event(conn, strategy, symbol, event_type, qty_delta, cash_delta, price, avg_entry_before,
@@ -215,8 +330,13 @@ def apply_fill(strategy, symbol, side, filled_qty, fill_price, db_path=None, ord
                 new_qty = 0.0
                 conn.execute('DELETE FROM positions WHERE strategy = ? AND symbol = ?', (strategy, symbol))
             else:
-                conn.execute('UPDATE positions SET qty = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
-                             (new_qty, now, strategy, symbol))
+                # A sell only ever sells what the broker holds, never the flagged
+                # remainder; the flag can at most equal what is left (R-1).
+                conn.execute('''UPDATE positions SET qty = ?, updated_at = ?,
+                                discrepancy_qty = CASE WHEN discrepancy_qty IS NOT NULL AND discrepancy_qty > ?
+                                                       THEN ? ELSE discrepancy_qty END
+                                WHERE strategy = ? AND symbol = ?''',
+                             (new_qty, now, new_qty, new_qty, strategy, symbol))
             _insert_event(conn, strategy, symbol, EVENT_FILL, -filled_qty, cash_delta, fill_price, avg, qty, new_qty,
                           reason or "broker sell fill", broker_order_id, extra=f"realized={realized:.6f}")
         else:
@@ -264,6 +384,9 @@ def write_off(strategy, symbol, qty, mark_price, reason, account_qty_observed=No
     INTERNAL reconciliation: removes `qty` of `symbol` from the strategy's
     ledger because the shares are no longer at the broker under this
     strategy's claim (sold outside the system, legacy close_all, manual trade).
+    Remediation R-1 (owner decision D1-B): the engine never calls this. It is
+    reached only through execution.manual_write_off, i.e. a human running
+    tools/reconcile_position.py, and it reduces the position's flag.
 
     No broker fill occurred, so this must never masquerade as one:
       * cash is credited at min(mark, average entry): equity can never INCREASE
@@ -300,8 +423,12 @@ def write_off(strategy, symbol, qty, mark_price, reason, account_qty_observed=No
             new_qty = 0.0
             conn.execute('DELETE FROM positions WHERE strategy = ? AND symbol = ?', (strategy, symbol))
         else:
-            conn.execute('UPDATE positions SET qty = ?, updated_at = ? WHERE strategy = ? AND symbol = ?',
-                         (new_qty, now, strategy, symbol))
+            # The written-off quantity comes out of the flagged quantity first (R-1).
+            conn.execute('''UPDATE positions SET qty = ?, updated_at = ?,
+                            discrepancy_qty = CASE WHEN discrepancy_qty IS NULL OR discrepancy_qty - ? <= 1e-12
+                                                   THEN NULL ELSE discrepancy_qty - ? END
+                            WHERE strategy = ? AND symbol = ?''',
+                         (new_qty, now, qty, qty, strategy, symbol))
         conn.execute('UPDATE strategy_state SET cash_budget = ?, updated_at = ? WHERE strategy = ?',
                      (cash + cash_delta, now, strategy))
         _insert_event(conn, strategy, symbol, EVENT_WRITE_OFF_DRIFT, -qty, cash_delta, basis, avg, owned, new_qty,
@@ -340,16 +467,24 @@ def strategy_equity(strategy, mark_prices, db_path=None):
     Returns (equity, positions_value, missing_marks).
     """
     state = get_strategy_state(strategy, db_path)
-    positions = list_positions(strategy, db_path)
-    last_marks = get_last_marks(strategy, db_path)
+    with db_connection(db_path) as conn:
+        rows = conn.execute('''SELECT symbol, qty, avg_entry_price, last_mark, discrepancy_qty
+                                FROM positions WHERE strategy = ? AND qty > 0''', (strategy,)).fetchall()
     value = 0.0
     missing = []
-    for symbol, (qty, avg, _) in positions.items():
+    for symbol, qty, avg, last_mark, flagged in rows:
+        qty, avg = float(qty), float(avg)
+        flagged = min(qty, float(flagged)) if flagged else 0.0
         px = mark_prices.get(symbol)
         if px is None or not (px > 0):
             missing.append(symbol)
-            px = last_marks.get(symbol) or avg
-        value += qty * px
+            px = last_mark or avg
+        # Flagged quantity (not at the broker) is valued at the LOWEST of the
+        # current mark, the last accepted mark and the average entry: an
+        # unrealized gain on shares we cannot see is never counted, a loss is.
+        # No loss is realized and cash is unchanged (remediation R-1).
+        flag_px = conservative_price(px, last_mark, avg) if flagged else 0.0
+        value += (qty - flagged) * px + flagged * flag_px
     return state["cash_budget"] + value, value, missing
 
 

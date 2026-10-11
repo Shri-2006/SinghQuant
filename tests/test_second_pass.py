@@ -89,11 +89,14 @@ def test_s03_account_short_of_sum_of_ledgers_never_sells_another_strategys_share
     submit_and_track(api, "risky1", "TSLA", "buy", 0.1446, 345.82, "x", db_path=db_path, **FAST)
     api.positions["TSLA"]["qty"] = 50.0             # risky1's 0.1446 sold outside the system
     res = close_strategy_position(api, "risky1", "TSLA", 345.82, "Momentum turned negative", db_path=db_path, **FAST)
-    assert res.status == "reconciled"               # first-pass code would have sold 0.1446 of stable's shares
+    assert res.status == "discrepancy"              # first-pass code would have sold 0.1446 of stable's shares
     assert [o for o in api.submitted if o["side"] == "sell"] == []
     assert api.positions["TSLA"]["qty"] == pytest.approx(50.0)
-    assert portfolio.get_position_qty("risky1", "TSLA", db_path) == 0.0
+    # R-1: risky1's vanished 0.1446 is flagged and preserved, not written off ...
+    assert portfolio.get_position_qty("risky1", "TSLA", db_path) == pytest.approx(0.1446)
+    assert portfolio.get_discrepancy_qty("risky1", "TSLA", db_path) == pytest.approx(0.1446)
     assert portfolio.get_position_qty("stable", "TSLA", db_path) == pytest.approx(50.0)
+    # ... and a flagged quantity is not a claim on the account, so stable still sells all 50
     res = close_strategy_position(api, "stable", "TSLA", 345.82, "ML SELL", db_path=db_path, **FAST)
     assert res.status == "filled" and res.filled_qty == pytest.approx(50.0)
 
@@ -105,10 +108,13 @@ def test_s03_partial_shortfall_sells_only_what_is_left_after_others_claims(db_pa
     api.positions["AAPL"]["qty"] = 1.2              # 0.3 vanished; stable's claim of 1.0 is honoured first
     res = close_strategy_position(api, "risky1", "AAPL", 200.0, "x", db_path=db_path, **FAST)
     assert res.filled_qty == pytest.approx(0.2)
-    assert portfolio.get_position_qty("risky1", "AAPL", db_path) == 0.0
+    # R-1: the vanished 0.3 stays in risky1's ledger, flagged for manual reconciliation
+    assert portfolio.get_position_qty("risky1", "AAPL", db_path) == pytest.approx(0.3)
+    assert portfolio.get_discrepancy_qty("risky1", "AAPL", db_path) == pytest.approx(0.3)
     assert api.positions["AAPL"]["qty"] == pytest.approx(1.0)
     rows = [r for r in get_trades_full("risky1", db_path) if r["action"] == "RECONCILE"]
     assert len(rows) == 1 and rows[0]["quantity"] == pytest.approx(0.3)
+    assert rows[0]["status"] == "discrepancy_flagged"
 
 
 # S-04 ----------------------------------------------------------------------
@@ -227,6 +233,7 @@ def test_s08_position_in_symbol_removed_from_config_is_still_stopped_out(db_path
     assert portfolio.get_position_qty("risky1", "TSLA", db_path) == 0.0
     # and it is never re-entered because it is not a configured asset
     api.set_price("TSLA", 400.0); frames["TSLA"] = make_featured_df(price=400.0)
+    api.seed_position("TSLA", 0.01, 400.0)          # a real broker holding, so it is not a discrepancy (R-1)
     portfolio.adopt_position("risky1", "TSLA", 0.01, 400.0, db_path)
     out = run_cycle(ctx, api, **FAST)
     assert out["tickers"]["TSLA"] in ("entry-blocked", "at-max", "hold")

@@ -34,6 +34,10 @@ def heartbeat_indicator (status):
         return "🟢 Running Good"
     elif status == "PAUSED":
         return "🟡 Bot Paused"
+    elif status == "HALTED":
+        return "⛔ Halted (kill switch)"
+    elif status == "SUSPECT":
+        return "🟠 Suspect data (entries blocked)"
     else:
         return "🔴 Bot Disconnected"
     
@@ -238,9 +242,11 @@ with tab3:
         for strategy in STRATEGIES:
             for sym, (qty, avg, opened) in portfolio.list_positions(strategy).items():
                 px = broker_px.get(sym.replace("X:", ""))
+                missing = portfolio.get_discrepancy_qty(strategy, sym)
                 ledger_rows.append({"Strategy": strategy.upper(), "Symbol": sym, "Qty": qty,
                                     "Avg Entry": f"${avg:,.2f}", "Mark": f"${px:,.2f}" if px else "n/a",
-                                    "Unrealized": f"${qty * (px - avg):+,.2f}" if px else "n/a", "Opened": opened})
+                                    "Unrealized": f"${qty * (px - avg):+,.2f}" if px else "n/a", "Opened": opened,
+                                    "Discrepancy": f"⚠️ {missing:g} missing at broker" if missing > 0 else ""})
         if ledger_rows:
             st.dataframe(pd.DataFrame(ledger_rows), use_container_width=True)
         else:

@@ -141,7 +141,10 @@ def test_smoke_imports_pass_without_network_or_credentials(tmp_path):
 def _source_files():
     out = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__", ".pytest_cache")]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in (".git", ".venv", "__pycache__", ".pytest_cache")
+        ]
         for f in filenames:
             rel = os.path.relpath(os.path.join(dirpath, f), ROOT).replace(os.sep, "/")
             if rel.endswith((".py", ".txt", ".sh", ".yml", ".md")) and not rel.startswith(("database/", "model_artifacts/", "cutover/")):
